@@ -2,23 +2,19 @@ import asyncio
 import json
 import logging
 import os
+import re
 import signal
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
-from aiogram import Bot, Dispatcher, Router
-from aiogram.client.default import DefaultBotProperties
-from aiogram.enums import ParseMode
-from aiogram.filters import Command, CommandObject
-from aiogram.types import Message
 from dotenv import load_dotenv
-from pyrogram import Client
+from pyrogram import Client, filters, idle
 from pyrogram.errors import FloodWait, RPCError
+from pyrogram.types import Message
 
 load_dotenv()
 
-BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 API_ID = int(os.getenv("API_ID", "0") or 0)
 API_HASH = os.getenv("API_HASH", "").strip()
 SESSION_STRING = os.getenv("SESSION_STRING", "").strip()
@@ -44,8 +40,6 @@ CLEAR_STATE_ON_FINISH = os.getenv("CLEAR_STATE_ON_FINISH", "true").lower() == "t
 
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 
-if not BOT_TOKEN:
-    raise RuntimeError("BOT_TOKEN is required")
 if not API_ID:
     raise RuntimeError("API_ID is required")
 if not API_HASH:
@@ -61,26 +55,11 @@ logging.basicConfig(
     level=getattr(logging, LOG_LEVEL, logging.INFO),
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
 )
-logger = logging.getLogger("inline-seeder")
-
-router = Router()
-dp = Dispatcher()
-dp.include_router(router)
-
-bot: Optional[Bot] = None
-user_client: Optional[Client] = None
+logger = logging.getLogger("inline-seeder-userbot")
 
 
 def clean_value(value: str) -> str:
     return " ".join((value or "").split()).strip()
-
-
-def html_escape(text: str) -> str:
-    return (
-        text.replace("&", "&amp;")
-        .replace("<", "&lt;")
-        .replace(">", "&gt;")
-    )
 
 
 def parse_chat_ref(value: str):
@@ -91,22 +70,6 @@ def parse_chat_ref(value: str):
 
 
 DEFAULT_TARGET_CHAT = parse_chat_ref(DEFAULT_TARGET_CHAT_RAW)
-
-
-def is_owner(message: Message) -> bool:
-    return bool(message.from_user and message.from_user.id in OWNER_IDS)
-
-
-def is_target_chat(message: Message) -> bool:
-    return bool(message.chat and message.chat.id == DEFAULT_TARGET_CHAT)
-
-
-async def require_owner_in_target_chat(message: Message) -> bool:
-    if not is_target_chat(message):
-        return False
-    if not is_owner(message):
-        return False
-    return True
 
 
 def _state_path() -> Path:
@@ -142,22 +105,6 @@ def clear_progress_state() -> None:
             path.unlink()
     except Exception:
         logger.exception("Failed to clear state file")
-
-
-async def notify_target_chat_error(text: str) -> None:
-    global bot
-
-    if bot is None:
-        return
-
-    try:
-        await bot.send_message(
-            chat_id=DEFAULT_TARGET_CHAT,
-            text=text,
-            parse_mode=ParseMode.HTML,
-        )
-    except Exception:
-        logger.exception("Failed to send error notification to target chat")
 
 
 @dataclass
@@ -353,6 +300,15 @@ class InlineSeeder:
 
         raise RuntimeError(f"send_inline_bot_result failed after {MAX_RETRIES} retries: {last_exc}")
 
+    async def _notify_target_chat_error(self, text: str) -> None:
+        try:
+            await self.client.send_message(
+                chat_id=DEFAULT_TARGET_CHAT,
+                text=text,
+            )
+        except Exception:
+            logger.exception("Failed to send error notification to target chat")
+
     async def _worker(self, source_bot: str):
         offset = self.state.current_offset or ""
         start_index = self.state.current_index or 0
@@ -435,15 +391,15 @@ class InlineSeeder:
             logger.exception("Seeder worker failed")
 
             error_text = (
-                "⚠️ <b>Inline Seeder Stopped</b>\n\n"
-                f"Source bot: <code>{html_escape(source_bot)}</code>\n"
-                f"Target chat: <code>{html_escape(str(DEFAULT_TARGET_CHAT))}</code>\n"
-                f"Sent count: <code>{self.state.sent_count}</code>\n"
-                f"Current offset: <code>{html_escape(self.state.current_offset or '-')}</code>\n"
-                f"Current index: <code>{self.state.current_index}</code>\n"
-                f"Last error: <code>{html_escape(self.state.last_error or 'unknown')}</code>"
+                "⚠️ Inline Seeder Stopped\n\n"
+                f"Source bot: {source_bot}\n"
+                f"Target chat: {DEFAULT_TARGET_CHAT}\n"
+                f"Sent count: {self.state.sent_count}\n"
+                f"Current offset: {self.state.current_offset or '-'}\n"
+                f"Current index: {self.state.current_index}\n"
+                f"Last error: {self.state.last_error or 'unknown'}"
             )
-            await notify_target_chat_error(error_text)
+            await self._notify_target_chat_error(error_text)
 
         finally:
             self.state.running = False
@@ -453,148 +409,137 @@ class InlineSeeder:
                 logger.info("Seeder worker stopped")
 
 
-SEEDER: Optional[InlineSeeder] = None
+app = Client(
+    name="inline_seeder_userbot",
+    api_id=API_ID,
+    api_hash=API_HASH,
+    session_string=SESSION_STRING,
+    in_memory=True,
+)
+
+SEEDER = InlineSeeder(app)
 
 
-@router.message(Command("start"))
-async def start_handler(message: Message):
-    if not await require_owner_in_target_chat(message):
-        return
+def parse_delay_from_text(text: str, default_delay: int) -> int:
+    parts = clean_value(text).split()
+    if len(parts) < 2:
+        return default_delay
+    if not parts[1].isdigit():
+        raise ValueError("Delay must be a number")
+    return int(parts[1])
 
-    await message.reply(
-        "Inline Seeder ready.\n\n"
-        f"Mode: <b>polling</b>\n"
-        f"Target chat: <code>{html_escape(str(DEFAULT_TARGET_CHAT))}</code>\n"
-        f"Catcher: <code>{html_escape(CATCHER_INLINE_BOT)}</code>\n"
-        f"Seizer: <code>{html_escape(SEIZER_INLINE_BOT)}</code>\n"
-        f"Default delay: <code>{DEFAULT_SEND_DELAY}</code>s\n"
-        f"Max retries: <code>{MAX_RETRIES}</code>\n"
-        f"Retry base delay: <code>{RETRY_BASE_DELAY}</code>s\n"
-        f"State file: <code>{html_escape(STATE_FILE)}</code>\n\n"
-        "Commands:\n"
-        "/startcatcherbot\n"
-        "/startcatcherbot 5\n"
-        "/startseizerbot\n"
-        "/startseizerbot 10\n"
-        "/stopinlinebot\n"
-        "/resetinlineprogress\n"
+
+def command_name(text: str) -> str:
+    return clean_value(text).split()[0].lower() if clean_value(text) else ""
+
+
+@app.on_message(filters.chat(DEFAULT_TARGET_CHAT) & filters.user(list(OWNER_IDS)) & filters.text)
+async def command_handler(client: Client, message: Message):
+    text = clean_value(message.text or "")
+    cmd = command_name(text)
+
+    if cmd not in {
+        "/start",
         "/status",
-        parse_mode=ParseMode.HTML,
-    )
-
-
-@router.message(Command("status"))
-async def status_handler(message: Message):
-    if not await require_owner_in_target_chat(message):
+        "/startcatcherbot",
+        "/startseizerbot",
+        "/stopinlinebot",
+        "/resetinlineprogress",
+    }:
         return
-
-    me = await user_client.get_me()
-    state = SEEDER.state
-    await message.reply(
-        f"Running: <b>{'YES' if SEEDER.is_running() else 'NO'}</b>\n"
-        f"User session: <code>{html_escape(me.first_name or '')}</code> (<code>{me.id}</code>)\n"
-        f"Source bot: <code>{html_escape(state.source_bot or '-')}</code>\n"
-        f"Target chat: <code>{html_escape(str(state.target_chat))}</code>\n"
-        f"Delay: <code>{state.delay_seconds}</code>s\n"
-        f"Sent count: <code>{state.sent_count}</code>\n"
-        f"Current offset: <code>{html_escape(state.current_offset or '-')}</code>\n"
-        f"Current index: <code>{state.current_index}</code>\n"
-        f"Last error: <code>{html_escape(state.last_error or '-')}</code>",
-        parse_mode=ParseMode.HTML,
-    )
-
-
-async def _start_seed_from_command(message: Message, command: CommandObject, source_bot: str):
-    if not await require_owner_in_target_chat(message):
-        return
-
-    raw = clean_value(command.args or "")
-    delay_seconds = DEFAULT_SEND_DELAY
-
-    if raw:
-        if not raw.isdigit():
-            await message.reply("Usage:\n/startcatcherbot\n/startcatcherbot 5\n/startseizerbot\n/startseizerbot 10")
-            return
-        delay_seconds = int(raw)
 
     try:
-        await SEEDER.start(source_bot=source_bot, delay_seconds=delay_seconds)
-        await message.reply(
-            f"Started.\n"
-            f"Source bot: <code>{html_escape(source_bot)}</code>\n"
-            f"Target chat: <code>{html_escape(str(DEFAULT_TARGET_CHAT))}</code>\n"
-            f"Delay: <code>{delay_seconds}</code>s\n"
-            f"Max retries: <code>{MAX_RETRIES}</code>\n"
-            f"Resume from offset: <code>{html_escape(SEEDER.state.current_offset or '-')}</code>\n"
-            f"Resume from index: <code>{SEEDER.state.current_index}</code>",
-            parse_mode=ParseMode.HTML,
-        )
+        if cmd == "/start":
+            await message.reply(
+                "Inline Seeder ready.\n\n"
+                f"Mode: userbot only\n"
+                f"Target chat: {DEFAULT_TARGET_CHAT}\n"
+                f"Catcher: {CATCHER_INLINE_BOT}\n"
+                f"Seizer: {SEIZER_INLINE_BOT}\n"
+                f"Default delay: {DEFAULT_SEND_DELAY}s\n"
+                f"Max retries: {MAX_RETRIES}\n"
+                f"Retry base delay: {RETRY_BASE_DELAY}s\n"
+                f"State file: {STATE_FILE}\n\n"
+                "Commands:\n"
+                "/startcatcherbot\n"
+                "/startcatcherbot 5\n"
+                "/startseizerbot\n"
+                "/startseizerbot 10\n"
+                "/stopinlinebot\n"
+                "/resetinlineprogress\n"
+                "/status"
+            )
+            return
+
+        if cmd == "/status":
+            me = await client.get_me()
+            state = SEEDER.state
+            await message.reply(
+                f"Running: {'YES' if SEEDER.is_running() else 'NO'}\n"
+                f"User session: {me.first_name or ''} ({me.id})\n"
+                f"Source bot: {state.source_bot or '-'}\n"
+                f"Target chat: {state.target_chat}\n"
+                f"Delay: {state.delay_seconds}s\n"
+                f"Sent count: {state.sent_count}\n"
+                f"Current offset: {state.current_offset or '-'}\n"
+                f"Current index: {state.current_index}\n"
+                f"Last error: {state.last_error or '-'}"
+            )
+            return
+
+        if cmd == "/stopinlinebot":
+            stopped = await SEEDER.stop()
+            if not stopped:
+                await message.reply("Seeder is not running.")
+                return
+            await message.reply(f"Stopped.\nSent count: {SEEDER.state.sent_count}")
+            return
+
+        if cmd == "/resetinlineprogress":
+            if SEEDER.is_running():
+                await message.reply("Seeder running ဖြစ်နေပါတယ်။ အရင် /stopinlinebot လုပ်ပါ။")
+                return
+            clear_progress_state()
+            await message.reply("Inline progress state cleared.")
+            return
+
+        if cmd == "/startcatcherbot":
+            delay_seconds = parse_delay_from_text(text, DEFAULT_SEND_DELAY)
+            await SEEDER.start(CATCHER_INLINE_BOT, delay_seconds)
+            await message.reply(
+                "Started.\n"
+                f"Source bot: {CATCHER_INLINE_BOT}\n"
+                f"Target chat: {DEFAULT_TARGET_CHAT}\n"
+                f"Delay: {delay_seconds}s\n"
+                f"Resume from offset: {SEEDER.state.current_offset or '-'}\n"
+                f"Resume from index: {SEEDER.state.current_index}"
+            )
+            return
+
+        if cmd == "/startseizerbot":
+            delay_seconds = parse_delay_from_text(text, DEFAULT_SEND_DELAY)
+            await SEEDER.start(SEIZER_INLINE_BOT, delay_seconds)
+            await message.reply(
+                "Started.\n"
+                f"Source bot: {SEIZER_INLINE_BOT}\n"
+                f"Target chat: {DEFAULT_TARGET_CHAT}\n"
+                f"Delay: {delay_seconds}s\n"
+                f"Resume from offset: {SEEDER.state.current_offset or '-'}\n"
+                f"Resume from index: {SEEDER.state.current_index}"
+            )
+            return
+
     except Exception as e:
-        await message.reply(f"Error: {html_escape(str(e))}", parse_mode=ParseMode.HTML)
-
-
-@router.message(Command("startcatcherbot"))
-async def startcatcherbot_handler(message: Message, command: CommandObject):
-    await _start_seed_from_command(message, command, CATCHER_INLINE_BOT)
-
-
-@router.message(Command("startseizerbot"))
-async def startseizerbot_handler(message: Message, command: CommandObject):
-    await _start_seed_from_command(message, command, SEIZER_INLINE_BOT)
-
-
-@router.message(Command("stopinlinebot"))
-async def stopinlinebot_handler(message: Message):
-    if not await require_owner_in_target_chat(message):
-        return
-
-    stopped = await SEEDER.stop()
-    if not stopped:
-        await message.reply("Seeder is not running.")
-        return
-
-    await message.reply(
-        f"Stopped.\nSent count: <code>{SEEDER.state.sent_count}</code>",
-        parse_mode=ParseMode.HTML,
-    )
-
-
-@router.message(Command("resetinlineprogress"))
-async def resetinlineprogress_handler(message: Message):
-    if not await require_owner_in_target_chat(message):
-        return
-
-    if SEEDER.is_running():
-        await message.reply("Seeder running ဖြစ်နေပါတယ်။ အရင် /stopinlinebot လုပ်ပါ။")
-        return
-
-    clear_progress_state()
-    await message.reply("Inline progress state cleared.")
+        await message.reply(f"Error: {e}")
 
 
 async def main():
-    global bot, user_client, SEEDER
+    await app.start()
 
-    bot = Bot(
-        token=BOT_TOKEN,
-        default=DefaultBotProperties(parse_mode=ParseMode.HTML),
-    )
-
-    user_client = Client(
-        name="inline_seeder_session",
-        api_id=API_ID,
-        api_hash=API_HASH,
-        session_string=SESSION_STRING,
-        in_memory=True,
-    )
-    await user_client.start()
-
-    SEEDER = InlineSeeder(user_client)
-
-    me = await user_client.get_me()
+    me = await app.get_me()
     logger.info("User session started as %s (%s)", me.first_name, me.id)
-    logger.info("Running in polling mode")
     logger.info("Target chat: %r", DEFAULT_TARGET_CHAT)
+    logger.info("Owner IDs: %s", sorted(OWNER_IDS))
 
     stop_event = asyncio.Event()
 
@@ -608,49 +553,21 @@ async def main():
         except NotImplementedError:
             pass
 
-    polling_task: Optional[asyncio.Task] = None
+    idle_task = asyncio.create_task(idle())
+    stop_task = asyncio.create_task(stop_event.wait())
 
-    try:
-        await bot.delete_webhook(drop_pending_updates=False)
-        polling_task = asyncio.create_task(
-            dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
-        )
-        stop_task = asyncio.create_task(stop_event.wait())
+    done, pending = await asyncio.wait(
+        {idle_task, stop_task},
+        return_when=asyncio.FIRST_COMPLETED,
+    )
 
-        done, pending = await asyncio.wait(
-            {polling_task, stop_task},
-            return_when=asyncio.FIRST_COMPLETED,
-        )
+    for task in pending:
+        task.cancel()
 
-        for task in pending:
-            task.cancel()
+    if SEEDER.is_running():
+        await SEEDER.stop()
 
-        if polling_task in done:
-            await polling_task
-
-    finally:
-        logger.info("Shutting down")
-
-        if SEEDER.is_running():
-            await SEEDER.stop()
-
-        try:
-            await dp.stop_polling()
-        except Exception:
-            pass
-
-        if polling_task:
-            polling_task.cancel()
-
-        try:
-            await user_client.stop()
-        except Exception:
-            pass
-
-        try:
-            await bot.session.close()
-        except Exception:
-            pass
+    await app.stop()
 
 
 if __name__ == "__main__":
