@@ -1,17 +1,17 @@
 import asyncio
+import json
 import logging
 import os
 import signal
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Optional
 
-from aiohttp import web
 from aiogram import Bot, Dispatcher, Router
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.filters import Command, CommandObject
 from aiogram.types import Message
-from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
 from dotenv import load_dotenv
 from pyrogram import Client
 from pyrogram.errors import FloodWait, RPCError
@@ -36,11 +36,11 @@ MAX_SEND_DELAY = int(os.getenv("MAX_SEND_DELAY", "30"))
 CATCHER_INLINE_BOT = os.getenv("CATCHER_INLINE_BOT", "@Character_Catcher_Bot").strip()
 SEIZER_INLINE_BOT = os.getenv("SEIZER_INLINE_BOT", "@Character_Seizer_Bot").strip()
 
-USE_WEBHOOK = os.getenv("USE_WEBHOOK", "false").lower() == "true"
-PUBLIC_URL = os.getenv("PUBLIC_URL", "").strip()
-WEBHOOK_PATH = os.getenv("WEBHOOK_PATH", "/webhook").strip() or "/webhook"
-WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "").strip()
-PORT = int(os.getenv("PORT", "8080"))
+MAX_RETRIES = int(os.getenv("MAX_RETRIES", "5"))
+RETRY_BASE_DELAY = int(os.getenv("RETRY_BASE_DELAY", "3"))
+
+STATE_FILE = os.getenv("STATE_FILE", "seeder_state.json").strip()
+CLEAR_STATE_ON_FINISH = os.getenv("CLEAR_STATE_ON_FINISH", "true").lower() == "true"
 
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 
@@ -56,8 +56,6 @@ if not OWNER_IDS:
     raise RuntimeError("OWNER_IDS is required")
 if not DEFAULT_TARGET_CHAT_RAW:
     raise RuntimeError("DEFAULT_TARGET_CHAT is required")
-if USE_WEBHOOK and (not PUBLIC_URL or not WEBHOOK_SECRET):
-    raise RuntimeError("PUBLIC_URL and WEBHOOK_SECRET are required when USE_WEBHOOK=true")
 
 logging.basicConfig(
     level=getattr(logging, LOG_LEVEL, logging.INFO),
@@ -83,10 +81,6 @@ def html_escape(text: str) -> str:
         .replace("<", "&lt;")
         .replace(">", "&gt;")
     )
-
-
-def normalize_webhook_path(path: str) -> str:
-    return path if path.startswith("/") else f"/{path}"
 
 
 def parse_chat_ref(value: str):
@@ -115,6 +109,57 @@ async def require_owner_in_target_chat(message: Message) -> bool:
     return True
 
 
+def _state_path() -> Path:
+    return Path(STATE_FILE)
+
+
+def load_progress_state() -> dict:
+    path = _state_path()
+    if not path.exists():
+        return {}
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        logger.exception("Failed to read state file")
+        return {}
+
+
+def save_progress_state(data: dict) -> None:
+    path = _state_path()
+    try:
+        path.write_text(
+            json.dumps(data, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+    except Exception:
+        logger.exception("Failed to write state file")
+
+
+def clear_progress_state() -> None:
+    path = _state_path()
+    try:
+        if path.exists():
+            path.unlink()
+    except Exception:
+        logger.exception("Failed to clear state file")
+
+
+async def notify_target_chat_error(text: str) -> None:
+    global bot
+
+    if bot is None:
+        return
+
+    try:
+        await bot.send_message(
+            chat_id=DEFAULT_TARGET_CHAT,
+            text=text,
+            parse_mode=ParseMode.HTML,
+        )
+    except Exception:
+        logger.exception("Failed to send error notification to target chat")
+
+
 @dataclass
 class RunnerState:
     running: bool = False
@@ -122,6 +167,7 @@ class RunnerState:
     delay_seconds: int = DEFAULT_SEND_DELAY
     target_chat: str | int = DEFAULT_TARGET_CHAT
     current_offset: str = ""
+    current_index: int = 0
     last_error: str = ""
     source_bot: str = ""
 
@@ -136,18 +182,44 @@ class InlineSeeder:
     def is_running(self) -> bool:
         return self.task is not None and not self.task.done()
 
+    def _load_resume_state_for_bot(self, source_bot: str) -> tuple[str, int, int]:
+        data = load_progress_state()
+        saved_bot = str(data.get("source_bot") or "")
+        if not data or saved_bot != source_bot:
+            return "", 0, 0
+
+        offset = str(data.get("current_offset") or "")
+        index = int(data.get("current_index") or 0)
+        sent_count = int(data.get("sent_count") or 0)
+        return offset, index, sent_count
+
+    def _save_resume_state(self, source_bot: str, offset: str, index: int) -> None:
+        save_progress_state(
+            {
+                "source_bot": source_bot,
+                "target_chat": str(DEFAULT_TARGET_CHAT),
+                "current_offset": offset,
+                "current_index": index,
+                "sent_count": self.state.sent_count,
+                "delay_seconds": self.state.delay_seconds,
+            }
+        )
+
     async def start(self, source_bot: str, delay_seconds: int):
         if self.is_running():
             raise RuntimeError("Seeder is already running")
 
         delay_seconds = max(1, min(delay_seconds, MAX_SEND_DELAY))
+        resume_offset, resume_index, resume_sent_count = self._load_resume_state_for_bot(source_bot)
+
         self.stop_event = asyncio.Event()
         self.state = RunnerState(
             running=True,
-            sent_count=0,
+            sent_count=resume_sent_count,
             delay_seconds=delay_seconds,
             target_chat=DEFAULT_TARGET_CHAT,
-            current_offset="",
+            current_offset=resume_offset,
+            current_index=resume_index,
             last_error="",
             source_bot=source_bot,
         )
@@ -167,78 +239,218 @@ class InlineSeeder:
             self.state.running = False
         return True
 
-    async def _worker(self, source_bot: str):
-        offset = ""
-
+    async def _sleep_with_stop(self, seconds: float):
+        if seconds <= 0:
+            return
         try:
-            while not self.stop_event.is_set():
-                results = await self.client.get_inline_bot_results(
+            await asyncio.wait_for(self.stop_event.wait(), timeout=seconds)
+        except asyncio.TimeoutError:
+            pass
+
+    def _backoff_delay(self, attempt: int) -> int:
+        return RETRY_BASE_DELAY * (2 ** max(0, attempt - 1))
+
+    async def _retry_get_inline_results(self, source_bot: str, offset: str):
+        last_exc: Optional[Exception] = None
+
+        for attempt in range(1, MAX_RETRIES + 1):
+            if self.stop_event.is_set():
+                raise asyncio.CancelledError()
+
+            try:
+                return await self.client.get_inline_bot_results(
                     bot=source_bot,
                     query="",
                     offset=offset,
                 )
 
+            except FloodWait as e:
+                wait_for = int(getattr(e, "value", getattr(e, "x", 5)))
+                self.state.last_error = f"FloodWait(get_results): {wait_for}s"
+                logger.warning(
+                    "FloodWait on get_inline_bot_results from %s | attempt %s/%s | waiting %ss",
+                    source_bot,
+                    attempt,
+                    MAX_RETRIES,
+                    wait_for,
+                )
+                await self._sleep_with_stop(wait_for + 1)
+                last_exc = e
+
+            except (RPCError, OSError, TimeoutError) as e:
+                delay = self._backoff_delay(attempt)
+                self.state.last_error = f"get_results retry error: {e}"
+                logger.warning(
+                    "get_inline_bot_results failed from %s | attempt %s/%s | retry in %ss | error=%s",
+                    source_bot,
+                    attempt,
+                    MAX_RETRIES,
+                    delay,
+                    e,
+                )
+                last_exc = e
+                if attempt < MAX_RETRIES:
+                    await self._sleep_with_stop(delay)
+                else:
+                    break
+
+            except Exception as e:
+                self.state.last_error = f"get_results fatal: {e}"
+                logger.exception("Unexpected get_inline_bot_results error")
+                raise
+
+        raise RuntimeError(f"get_inline_bot_results failed after {MAX_RETRIES} retries: {last_exc}")
+
+    async def _retry_send_inline_result(self, source_bot: str, results, result_id: str):
+        last_exc: Optional[Exception] = None
+
+        for attempt in range(1, MAX_RETRIES + 1):
+            if self.stop_event.is_set():
+                raise asyncio.CancelledError()
+
+            try:
+                await self.client.send_inline_bot_result(
+                    chat_id=DEFAULT_TARGET_CHAT,
+                    query_id=results.query_id,
+                    result_id=result_id,
+                )
+                return
+
+            except FloodWait as e:
+                wait_for = int(getattr(e, "value", getattr(e, "x", 5)))
+                self.state.last_error = f"FloodWait(send_result): {wait_for}s"
+                logger.warning(
+                    "FloodWait on send_inline_bot_result from %s | attempt %s/%s | waiting %ss",
+                    source_bot,
+                    attempt,
+                    MAX_RETRIES,
+                    wait_for,
+                )
+                await self._sleep_with_stop(wait_for + 1)
+                last_exc = e
+
+            except (RPCError, OSError, TimeoutError) as e:
+                delay = self._backoff_delay(attempt)
+                self.state.last_error = f"send_result retry error: {e}"
+                logger.warning(
+                    "send_inline_bot_result failed from %s | attempt %s/%s | retry in %ss | error=%s",
+                    source_bot,
+                    attempt,
+                    MAX_RETRIES,
+                    delay,
+                    e,
+                )
+                last_exc = e
+                if attempt < MAX_RETRIES:
+                    await self._sleep_with_stop(delay)
+                else:
+                    break
+
+            except Exception as e:
+                self.state.last_error = f"send_result fatal: {e}"
+                logger.exception("Unexpected send_inline_bot_result error")
+                raise
+
+        raise RuntimeError(f"send_inline_bot_result failed after {MAX_RETRIES} retries: {last_exc}")
+
+    async def _worker(self, source_bot: str):
+        offset = self.state.current_offset or ""
+        start_index = self.state.current_index or 0
+        manual_stop = False
+
+        try:
+            while not self.stop_event.is_set():
+                results = await self._retry_get_inline_results(source_bot, offset)
+
                 if not results.results:
                     logger.info("No more inline results from %s", source_bot)
+                    if CLEAR_STATE_ON_FINISH:
+                        clear_progress_state()
                     break
 
                 logger.info(
-                    "Fetched %s results from %s | offset=%r | next_offset=%r",
+                    "Fetched %s results from %s | offset=%r | next_offset=%r | start_index=%s",
                     len(results.results),
                     source_bot,
                     offset,
                     results.next_offset,
+                    start_index,
                 )
 
-                for result in results.results:
+                safe_start_index = max(0, min(start_index, len(results.results)))
+
+                for idx in range(safe_start_index, len(results.results)):
                     if self.stop_event.is_set():
+                        manual_stop = True
                         break
 
-                    while True:
-                        try:
-                            await self.client.send_inline_bot_result(
-                                chat_id=DEFAULT_TARGET_CHAT,
-                                query_id=results.query_id,
-                                result_id=result.id,
-                            )
-                            self.state.sent_count += 1
-                            logger.info(
-                                "Sent #%s result_id=%s from %s to %r",
-                                self.state.sent_count,
-                                result.id,
-                                source_bot,
-                                DEFAULT_TARGET_CHAT,
-                            )
-                            break
+                    result = results.results[idx]
+                    await self._retry_send_inline_result(source_bot, results, result.id)
 
-                        except FloodWait as e:
-                            wait_for = int(getattr(e, "value", getattr(e, "x", 5)))
-                            logger.warning("FloodWait %ss", wait_for)
-                            await asyncio.sleep(wait_for + 1)
+                    self.state.sent_count += 1
+                    self.state.current_offset = offset
+                    self.state.current_index = idx + 1
+                    self._save_resume_state(source_bot, offset, idx + 1)
 
-                        except RPCError as e:
-                            self.state.last_error = str(e)
-                            logger.exception("RPCError while sending inline result")
-                            raise
+                    logger.info(
+                        "Sent #%s result_id=%s from %s to %r | page_offset=%r | next_index=%s",
+                        self.state.sent_count,
+                        result.id,
+                        source_bot,
+                        DEFAULT_TARGET_CHAT,
+                        offset,
+                        idx + 1,
+                    )
 
-                    await asyncio.sleep(self.state.delay_seconds)
+                    await self._sleep_with_stop(self.state.delay_seconds)
+
+                    if self.stop_event.is_set():
+                        manual_stop = True
+                        break
 
                 if self.stop_event.is_set():
+                    manual_stop = True
                     break
 
                 offset = results.next_offset or ""
+                start_index = 0
                 self.state.current_offset = offset
+                self.state.current_index = 0
+                self._save_resume_state(source_bot, offset, 0)
 
                 if not offset:
                     logger.info("Reached final page for %s", source_bot)
+                    if CLEAR_STATE_ON_FINISH:
+                        clear_progress_state()
                     break
+
+        except asyncio.CancelledError:
+            manual_stop = True
+            self.state.last_error = "cancelled"
+            logger.info("Seeder worker cancelled")
+            raise
 
         except Exception as e:
             self.state.last_error = str(e)
             logger.exception("Seeder worker failed")
+
+            error_text = (
+                "⚠️ <b>Inline Seeder Stopped</b>\n\n"
+                f"Source bot: <code>{html_escape(source_bot)}</code>\n"
+                f"Target chat: <code>{html_escape(str(DEFAULT_TARGET_CHAT))}</code>\n"
+                f"Sent count: <code>{self.state.sent_count}</code>\n"
+                f"Current offset: <code>{html_escape(self.state.current_offset or '-')}</code>\n"
+                f"Current index: <code>{self.state.current_index}</code>\n"
+                f"Last error: <code>{html_escape(self.state.last_error or 'unknown')}</code>"
+            )
+            await notify_target_chat_error(error_text)
+
         finally:
             self.state.running = False
-            logger.info("Seeder worker stopped")
+            if manual_stop:
+                logger.info("Seeder worker stopped manually")
+            else:
+                logger.info("Seeder worker stopped")
 
 
 SEEDER: Optional[InlineSeeder] = None
@@ -249,20 +461,23 @@ async def start_handler(message: Message):
     if not await require_owner_in_target_chat(message):
         return
 
-    mode = "webhook" if USE_WEBHOOK else "polling"
     await message.reply(
         "Inline Seeder ready.\n\n"
-        f"Mode: <b>{mode}</b>\n"
+        f"Mode: <b>polling</b>\n"
         f"Target chat: <code>{html_escape(str(DEFAULT_TARGET_CHAT))}</code>\n"
         f"Catcher: <code>{html_escape(CATCHER_INLINE_BOT)}</code>\n"
         f"Seizer: <code>{html_escape(SEIZER_INLINE_BOT)}</code>\n"
-        f"Default delay: <code>{DEFAULT_SEND_DELAY}</code>s\n\n"
+        f"Default delay: <code>{DEFAULT_SEND_DELAY}</code>s\n"
+        f"Max retries: <code>{MAX_RETRIES}</code>\n"
+        f"Retry base delay: <code>{RETRY_BASE_DELAY}</code>s\n"
+        f"State file: <code>{html_escape(STATE_FILE)}</code>\n\n"
         "Commands:\n"
         "/startcatcherbot\n"
         "/startcatcherbot 5\n"
         "/startseizerbot\n"
         "/startseizerbot 10\n"
         "/stopinlinebot\n"
+        "/resetinlineprogress\n"
         "/status",
         parse_mode=ParseMode.HTML,
     )
@@ -283,6 +498,7 @@ async def status_handler(message: Message):
         f"Delay: <code>{state.delay_seconds}</code>s\n"
         f"Sent count: <code>{state.sent_count}</code>\n"
         f"Current offset: <code>{html_escape(state.current_offset or '-')}</code>\n"
+        f"Current index: <code>{state.current_index}</code>\n"
         f"Last error: <code>{html_escape(state.last_error or '-')}</code>",
         parse_mode=ParseMode.HTML,
     )
@@ -307,7 +523,10 @@ async def _start_seed_from_command(message: Message, command: CommandObject, sou
             f"Started.\n"
             f"Source bot: <code>{html_escape(source_bot)}</code>\n"
             f"Target chat: <code>{html_escape(str(DEFAULT_TARGET_CHAT))}</code>\n"
-            f"Delay: <code>{delay_seconds}</code>s",
+            f"Delay: <code>{delay_seconds}</code>s\n"
+            f"Max retries: <code>{MAX_RETRIES}</code>\n"
+            f"Resume from offset: <code>{html_escape(SEEDER.state.current_offset or '-')}</code>\n"
+            f"Resume from index: <code>{SEEDER.state.current_index}</code>",
             parse_mode=ParseMode.HTML,
         )
     except Exception as e:
@@ -340,49 +559,17 @@ async def stopinlinebot_handler(message: Message):
     )
 
 
-async def healthz(_request: web.Request):
-    return web.json_response(
-        {
-            "ok": True,
-            "running": SEEDER.is_running(),
-            "sent_count": SEEDER.state.sent_count,
-            "target_chat": str(DEFAULT_TARGET_CHAT),
-            "source_bot": SEEDER.state.source_bot,
-        }
-    )
+@router.message(Command("resetinlineprogress"))
+async def resetinlineprogress_handler(message: Message):
+    if not await require_owner_in_target_chat(message):
+        return
 
+    if SEEDER.is_running():
+        await message.reply("Seeder running ဖြစ်နေပါတယ်။ အရင် /stopinlinebot လုပ်ပါ။")
+        return
 
-async def start_http_server(dp: Dispatcher, bot: Bot):
-    app = web.Application()
-    app.router.add_get("/", healthz)
-    app.router.add_get("/healthz", healthz)
-
-    if USE_WEBHOOK:
-        webhook_path = normalize_webhook_path(WEBHOOK_PATH)
-        SimpleRequestHandler(
-            dispatcher=dp,
-            bot=bot,
-            secret_token=WEBHOOK_SECRET,
-        ).register(app, path=webhook_path)
-        setup_application(app, dp, bot=bot)
-
-    runner = web.AppRunner(app)
-    await runner.setup()
-    site = web.TCPSite(runner, "0.0.0.0", PORT)
-    await site.start()
-
-    logger.info("HTTP server started on port %s", PORT)
-
-    if USE_WEBHOOK:
-        webhook_url = f"{PUBLIC_URL.rstrip('/')}{normalize_webhook_path(WEBHOOK_PATH)}"
-        await bot.set_webhook(
-            url=webhook_url,
-            secret_token=WEBHOOK_SECRET,
-            drop_pending_updates=False,
-        )
-        logger.info("Webhook set to %s", webhook_url)
-
-    return runner
+    clear_progress_state()
+    await message.reply("Inline progress state cleared.")
 
 
 async def main():
@@ -406,8 +593,8 @@ async def main():
 
     me = await user_client.get_me()
     logger.info("User session started as %s (%s)", me.first_name, me.id)
-
-    runner = await start_http_server(dp, bot)
+    logger.info("Running in polling mode")
+    logger.info("Target chat: %r", DEFAULT_TARGET_CHAT)
 
     stop_event = asyncio.Event()
 
@@ -421,25 +608,25 @@ async def main():
         except NotImplementedError:
             pass
 
+    polling_task: Optional[asyncio.Task] = None
+
     try:
-        if USE_WEBHOOK:
-            logger.info("Running in webhook mode")
-            await stop_event.wait()
-        else:
-            logger.info("Running in polling mode")
-            await bot.delete_webhook(drop_pending_updates=False)
-            polling_task = asyncio.create_task(
-                dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
-            )
-            stop_task = asyncio.create_task(stop_event.wait())
-            done, pending = await asyncio.wait(
-                {polling_task, stop_task},
-                return_when=asyncio.FIRST_COMPLETED,
-            )
-            for task in pending:
-                task.cancel()
-            if polling_task in done:
-                await polling_task
+        await bot.delete_webhook(drop_pending_updates=False)
+        polling_task = asyncio.create_task(
+            dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
+        )
+        stop_task = asyncio.create_task(stop_event.wait())
+
+        done, pending = await asyncio.wait(
+            {polling_task, stop_task},
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+
+        for task in pending:
+            task.cancel()
+
+        if polling_task in done:
+            await polling_task
 
     finally:
         logger.info("Shutting down")
@@ -448,14 +635,12 @@ async def main():
             await SEEDER.stop()
 
         try:
-            await bot.delete_webhook(drop_pending_updates=False)
-        except Exception:
-            pass
-
-        try:
             await dp.stop_polling()
         except Exception:
             pass
+
+        if polling_task:
+            polling_task.cancel()
 
         try:
             await user_client.stop()
@@ -464,11 +649,6 @@ async def main():
 
         try:
             await bot.session.close()
-        except Exception:
-            pass
-
-        try:
-            await runner.cleanup()
         except Exception:
             pass
 
