@@ -2,7 +2,6 @@ import asyncio
 import json
 import logging
 import os
-import re
 import signal
 from dataclasses import dataclass
 from pathlib import Path
@@ -38,6 +37,7 @@ RETRY_BASE_DELAY = int(os.getenv("RETRY_BASE_DELAY", "3"))
 STATE_FILE = os.getenv("STATE_FILE", "seeder_state.json").strip()
 CLEAR_STATE_ON_FINISH = os.getenv("CLEAR_STATE_ON_FINISH", "true").lower() == "true"
 
+SESSIONS_DIR = os.getenv("SESSIONS_DIR", "sessions").strip() or "sessions"
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 
 if not API_ID:
@@ -62,6 +62,10 @@ def clean_value(value: str) -> str:
     return " ".join((value or "").split()).strip()
 
 
+def normalize_username(value: str) -> str:
+    return clean_value(value).lstrip("@").lower()
+
+
 def parse_chat_ref(value: str):
     value = clean_value(value)
     if value.lstrip("-").isdigit():
@@ -70,6 +74,22 @@ def parse_chat_ref(value: str):
 
 
 DEFAULT_TARGET_CHAT = parse_chat_ref(DEFAULT_TARGET_CHAT_RAW)
+
+
+def target_chat_display() -> str:
+    return str(DEFAULT_TARGET_CHAT)
+
+
+def is_target_chat_message(message: Message) -> bool:
+    if not message.chat:
+        return False
+
+    if isinstance(DEFAULT_TARGET_CHAT, int):
+        return message.chat.id == DEFAULT_TARGET_CHAT
+
+    target_username = normalize_username(str(DEFAULT_TARGET_CHAT))
+    chat_username = normalize_username(getattr(message.chat, "username", "") or "")
+    return bool(chat_username and chat_username == target_username)
 
 
 def _state_path() -> Path:
@@ -276,6 +296,17 @@ class InlineSeeder:
                 await self._sleep_with_stop(wait_for + 1)
                 last_exc = e
 
+            except ValueError as e:
+                if "Peer id invalid" in str(e):
+                    msg = (
+                        f"Peer id invalid for target chat {DEFAULT_TARGET_CHAT}. "
+                        "User account ကို target group ထဲ join ထားပြီး "
+                        "group ကိုတစ်ခါဖွင့်၊ message တစ်ခါပို့ပြီး app ကိုပြန် run ပါ။"
+                    )
+                    self.state.last_error = msg
+                    raise RuntimeError(msg) from e
+                raise
+
             except (RPCError, OSError, TimeoutError) as e:
                 delay = self._backoff_delay(attempt)
                 self.state.last_error = f"send_result retry error: {e}"
@@ -409,12 +440,14 @@ class InlineSeeder:
                 logger.info("Seeder worker stopped")
 
 
+Path(SESSIONS_DIR).mkdir(parents=True, exist_ok=True)
+
 app = Client(
     name="inline_seeder_userbot",
     api_id=API_ID,
     api_hash=API_HASH,
     session_string=SESSION_STRING,
-    in_memory=True,
+    workdir=SESSIONS_DIR,
 )
 
 SEEDER = InlineSeeder(app)
@@ -433,8 +466,32 @@ def command_name(text: str) -> str:
     return clean_value(text).split()[0].lower() if clean_value(text) else ""
 
 
-@app.on_message(filters.chat(DEFAULT_TARGET_CHAT) & filters.user(list(OWNER_IDS)) & filters.text)
+async def warmup_client_peers(client: Client) -> None:
+    try:
+        async for dialog in client.get_dialogs():
+            _ = dialog.chat.id
+        logger.info("Dialogs warmup completed")
+    except Exception as e:
+        logger.warning("Dialogs warmup failed: %s", e)
+
+    try:
+        chat = await client.get_chat(DEFAULT_TARGET_CHAT)
+        title = getattr(chat, "title", None) or getattr(chat, "first_name", None) or ""
+        logger.info("Target chat resolved: %s (%s)", title, chat.id)
+    except Exception as e:
+        logger.error("Failed to resolve DEFAULT_TARGET_CHAT=%r : %s", DEFAULT_TARGET_CHAT, e)
+        raise RuntimeError(
+            "DEFAULT_TARGET_CHAT ကို user session က resolve မလုပ်နိုင်သေးပါ။ "
+            "user account ကို target group ထဲ join ထားပြီး group ကိုတစ်ခါဖွင့်၊ "
+            "message တစ်ခါပို့ပြီးမှ app ကိုပြန် run ပါ။"
+        ) from e
+
+
+@app.on_message(filters.user(list(OWNER_IDS)) & filters.text)
 async def command_handler(client: Client, message: Message):
+    if not is_target_chat_message(message):
+        return
+
     text = clean_value(message.text or "")
     cmd = command_name(text)
 
@@ -453,13 +510,14 @@ async def command_handler(client: Client, message: Message):
             await message.reply(
                 "Inline Seeder ready.\n\n"
                 f"Mode: userbot only\n"
-                f"Target chat: {DEFAULT_TARGET_CHAT}\n"
+                f"Target chat: {target_chat_display()}\n"
                 f"Catcher: {CATCHER_INLINE_BOT}\n"
                 f"Seizer: {SEIZER_INLINE_BOT}\n"
                 f"Default delay: {DEFAULT_SEND_DELAY}s\n"
                 f"Max retries: {MAX_RETRIES}\n"
                 f"Retry base delay: {RETRY_BASE_DELAY}s\n"
-                f"State file: {STATE_FILE}\n\n"
+                f"State file: {STATE_FILE}\n"
+                f"Sessions dir: {SESSIONS_DIR}\n\n"
                 "Commands:\n"
                 "/startcatcherbot\n"
                 "/startcatcherbot 5\n"
@@ -509,7 +567,7 @@ async def command_handler(client: Client, message: Message):
             await message.reply(
                 "Started.\n"
                 f"Source bot: {CATCHER_INLINE_BOT}\n"
-                f"Target chat: {DEFAULT_TARGET_CHAT}\n"
+                f"Target chat: {target_chat_display()}\n"
                 f"Delay: {delay_seconds}s\n"
                 f"Resume from offset: {SEEDER.state.current_offset or '-'}\n"
                 f"Resume from index: {SEEDER.state.current_index}"
@@ -522,7 +580,7 @@ async def command_handler(client: Client, message: Message):
             await message.reply(
                 "Started.\n"
                 f"Source bot: {SEIZER_INLINE_BOT}\n"
-                f"Target chat: {DEFAULT_TARGET_CHAT}\n"
+                f"Target chat: {target_chat_display()}\n"
                 f"Delay: {delay_seconds}s\n"
                 f"Resume from offset: {SEEDER.state.current_offset or '-'}\n"
                 f"Resume from index: {SEEDER.state.current_index}"
@@ -535,6 +593,7 @@ async def command_handler(client: Client, message: Message):
 
 async def main():
     await app.start()
+    await warmup_client_peers(app)
 
     me = await app.get_me()
     logger.info("User session started as %s (%s)", me.first_name, me.id)
