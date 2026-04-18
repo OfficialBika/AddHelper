@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Optional
 
 from dotenv import load_dotenv
-from pyrogram import Client, filters, idle
+from pyrogram import Client, filters
 from pyrogram.errors import FloodWait, RPCError
 from pyrogram.types import Message
 
@@ -74,22 +74,11 @@ def parse_chat_ref(value: str):
 
 
 DEFAULT_TARGET_CHAT = parse_chat_ref(DEFAULT_TARGET_CHAT_RAW)
+RESOLVED_TARGET_CHAT: str | int = DEFAULT_TARGET_CHAT
 
 
 def target_chat_display() -> str:
-    return str(DEFAULT_TARGET_CHAT)
-
-
-def is_target_chat_message(message: Message) -> bool:
-    if not message.chat:
-        return False
-
-    if isinstance(DEFAULT_TARGET_CHAT, int):
-        return message.chat.id == DEFAULT_TARGET_CHAT
-
-    target_username = normalize_username(str(DEFAULT_TARGET_CHAT))
-    chat_username = normalize_username(getattr(message.chat, "username", "") or "")
-    return bool(chat_username and chat_username == target_username)
+    return str(RESOLVED_TARGET_CHAT)
 
 
 def _state_path() -> Path:
@@ -125,6 +114,31 @@ def clear_progress_state() -> None:
             path.unlink()
     except Exception:
         logger.exception("Failed to clear state file")
+
+
+def is_target_chat_message(message: Message) -> bool:
+    if not message.chat:
+        return False
+
+    if isinstance(RESOLVED_TARGET_CHAT, int):
+        return message.chat.id == RESOLVED_TARGET_CHAT
+
+    target_username = normalize_username(str(RESOLVED_TARGET_CHAT))
+    chat_username = normalize_username(getattr(message.chat, "username", "") or "")
+    return bool(chat_username and chat_username == target_username)
+
+
+def is_owner_or_self_message(message: Message) -> bool:
+    if not message.from_user:
+        return False
+
+    if message.from_user.id in OWNER_IDS:
+        return True
+
+    if getattr(message, "outgoing", False):
+        return True
+
+    return False
 
 
 @dataclass
@@ -164,7 +178,7 @@ class InlineSeeder:
         save_progress_state(
             {
                 "source_bot": source_bot,
-                "target_chat": str(DEFAULT_TARGET_CHAT),
+                "target_chat": str(RESOLVED_TARGET_CHAT),
                 "current_offset": offset,
                 "current_index": index,
                 "sent_count": self.state.sent_count,
@@ -184,7 +198,7 @@ class InlineSeeder:
             running=True,
             sent_count=resume_sent_count,
             delay_seconds=delay_seconds,
-            target_chat=DEFAULT_TARGET_CHAT,
+            target_chat=RESOLVED_TARGET_CHAT,
             current_offset=resume_offset,
             current_index=resume_index,
             last_error="",
@@ -277,7 +291,7 @@ class InlineSeeder:
 
             try:
                 await self.client.send_inline_bot_result(
-                    chat_id=DEFAULT_TARGET_CHAT,
+                    chat_id=RESOLVED_TARGET_CHAT,
                     query_id=results.query_id,
                     result_id=result_id,
                 )
@@ -299,7 +313,7 @@ class InlineSeeder:
             except ValueError as e:
                 if "Peer id invalid" in str(e):
                     msg = (
-                        f"Peer id invalid for target chat {DEFAULT_TARGET_CHAT}. "
+                        f"Peer id invalid for target chat {RESOLVED_TARGET_CHAT}. "
                         "User account ကို target group ထဲ join ထားပြီး "
                         "group ကိုတစ်ခါဖွင့်၊ message တစ်ခါပို့ပြီး app ကိုပြန် run ပါ။"
                     )
@@ -334,7 +348,7 @@ class InlineSeeder:
     async def _notify_target_chat_error(self, text: str) -> None:
         try:
             await self.client.send_message(
-                chat_id=DEFAULT_TARGET_CHAT,
+                chat_id=RESOLVED_TARGET_CHAT,
                 text=text,
             )
         except Exception:
@@ -384,7 +398,7 @@ class InlineSeeder:
                         self.state.sent_count,
                         result.id,
                         source_bot,
-                        DEFAULT_TARGET_CHAT,
+                        RESOLVED_TARGET_CHAT,
                         offset,
                         idx + 1,
                     )
@@ -424,7 +438,7 @@ class InlineSeeder:
             error_text = (
                 "⚠️ Inline Seeder Stopped\n\n"
                 f"Source bot: {source_bot}\n"
-                f"Target chat: {DEFAULT_TARGET_CHAT}\n"
+                f"Target chat: {RESOLVED_TARGET_CHAT}\n"
                 f"Sent count: {self.state.sent_count}\n"
                 f"Current offset: {self.state.current_offset or '-'}\n"
                 f"Current index: {self.state.current_index}\n"
@@ -467,6 +481,8 @@ def command_name(text: str) -> str:
 
 
 async def warmup_client_peers(client: Client) -> None:
+    global RESOLVED_TARGET_CHAT
+
     try:
         async for dialog in client.get_dialogs():
             _ = dialog.chat.id
@@ -476,6 +492,7 @@ async def warmup_client_peers(client: Client) -> None:
 
     try:
         chat = await client.get_chat(DEFAULT_TARGET_CHAT)
+        RESOLVED_TARGET_CHAT = chat.id
         title = getattr(chat, "title", None) or getattr(chat, "first_name", None) or ""
         logger.info("Target chat resolved: %s (%s)", title, chat.id)
     except Exception as e:
@@ -487,13 +504,24 @@ async def warmup_client_peers(client: Client) -> None:
         ) from e
 
 
-@app.on_message(filters.user(list(OWNER_IDS)) & filters.text)
+@app.on_message(filters.text)
 async def command_handler(client: Client, message: Message):
     if not is_target_chat_message(message):
         return
 
     text = clean_value(message.text or "")
     cmd = command_name(text)
+
+    logger.info(
+        "CMD recv | chat=%s | from=%s | outgoing=%s | text=%r",
+        message.chat.id if message.chat else None,
+        message.from_user.id if message.from_user else None,
+        getattr(message, "outgoing", False),
+        text,
+    )
+
+    if not is_owner_or_self_message(message):
+        return
 
     if cmd not in {
         "/start",
@@ -588,6 +616,7 @@ async def command_handler(client: Client, message: Message):
             return
 
     except Exception as e:
+        logger.exception("Command handler failed")
         await message.reply(f"Error: {e}")
 
 
@@ -597,12 +626,13 @@ async def main():
 
     me = await app.get_me()
     logger.info("User session started as %s (%s)", me.first_name, me.id)
-    logger.info("Target chat: %r", DEFAULT_TARGET_CHAT)
+    logger.info("Target chat: %r", RESOLVED_TARGET_CHAT)
     logger.info("Owner IDs: %s", sorted(OWNER_IDS))
 
     stop_event = asyncio.Event()
 
-    def _stop(*_args):
+    def _stop():
+        logger.info("Stop signal received")
         stop_event.set()
 
     loop = asyncio.get_running_loop()
@@ -612,16 +642,7 @@ async def main():
         except NotImplementedError:
             pass
 
-    idle_task = asyncio.create_task(idle())
-    stop_task = asyncio.create_task(stop_event.wait())
-
-    done, pending = await asyncio.wait(
-        {idle_task, stop_task},
-        return_when=asyncio.FIRST_COMPLETED,
-    )
-
-    for task in pending:
-        task.cancel()
+    await stop_event.wait()
 
     if SEEDER.is_running():
         await SEEDER.stop()
@@ -630,4 +651,7 @@ async def main():
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        pass
