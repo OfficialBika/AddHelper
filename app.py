@@ -506,22 +506,26 @@ async def warmup_client_peers(client: Client) -> None:
 
 @app.on_message(filters.text)
 async def command_handler(client: Client, message: Message):
+    text = clean_value(message.text or "")
+    chat_id = getattr(message.chat, "id", None)
+    user_id = getattr(message.from_user, "id", None) if message.from_user else None
+
+    if is_target_chat_message(message):
+        logger.info(
+            "TARGET MSG | chat_id=%s | user_id=%s | text=%r",
+            chat_id,
+            user_id,
+            text,
+        )
+
     if not is_target_chat_message(message):
         return
 
-    text = clean_value(message.text or "")
-    cmd = command_name(text)
-
-    logger.info(
-        "CMD recv | chat=%s | from=%s | outgoing=%s | text=%r",
-        message.chat.id if message.chat else None,
-        message.from_user.id if message.from_user else None,
-        getattr(message, "outgoing", False),
-        text,
-    )
-
-    if not is_owner_or_self_message(message):
+    if user_id not in OWNER_IDS:
+        logger.info("IGNORED NON-OWNER | user_id=%s | text=%r", user_id, text)
         return
+
+    cmd = command_name(text)
 
     if cmd not in {
         "/start",
@@ -531,6 +535,7 @@ async def command_handler(client: Client, message: Message):
         "/stopinlinebot",
         "/resetinlineprogress",
     }:
+        logger.info("IGNORED UNKNOWN CMD | user_id=%s | text=%r", user_id, text)
         return
 
     try:
@@ -616,7 +621,7 @@ async def command_handler(client: Client, message: Message):
             return
 
     except Exception as e:
-        logger.exception("Command handler failed")
+        logger.exception("COMMAND ERROR")
         await message.reply(f"Error: {e}")
 
 
@@ -628,6 +633,12 @@ async def main():
     logger.info("User session started as %s (%s)", me.first_name, me.id)
     logger.info("Target chat: %r", RESOLVED_TARGET_CHAT)
     logger.info("Owner IDs: %s", sorted(OWNER_IDS))
+    
+    try:
+    await app.send_message(DEFAULT_TARGET_CHAT, "AddHelper online ✅")
+    logger.info("Startup test message sent to target chat")
+    except Exception as e:
+    logger.error("Startup test message failed: %s", e)
 
     stop_event = asyncio.Event()
 
