@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Optional
 
 from dotenv import load_dotenv
-from pyrogram import Client, filters
+from pyrogram import Client, filters, idle
 from pyrogram.errors import FloodWait, RPCError
 from pyrogram.types import Message
 
@@ -521,7 +521,7 @@ async def command_handler(client: Client, message: Message):
     if not is_target_chat_message(message):
         return
 
-    if user_id not in OWNER_IDS:
+    if not is_owner_or_self_message(message):
         logger.info("IGNORED NON-OWNER | user_id=%s | text=%r", user_id, text)
         return
 
@@ -635,7 +635,7 @@ async def main():
     logger.info("Owner IDs: %s", sorted(OWNER_IDS))
 
     try:
-        await app.send_message(DEFAULT_TARGET_CHAT, "AddHelper online ✅")
+        await app.send_message(RESOLVED_TARGET_CHAT, "AddHelper online ✅")
         logger.info("Startup test message sent to target chat")
     except Exception as e:
         logger.error("Startup test message failed: %s", e)
