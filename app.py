@@ -30,6 +30,7 @@ MAX_SEND_DELAY = int(os.getenv("MAX_SEND_DELAY", "30"))
 
 CATCHER_INLINE_BOT = os.getenv("CATCHER_INLINE_BOT", "@Character_Catcher_Bot").strip()
 SEIZER_INLINE_BOT = os.getenv("SEIZER_INLINE_BOT", "@Character_Seizer_Bot").strip()
+CAPTURE_INLINE_BOT = os.getenv("CAPTURE_INLINE_BOT", "@CaptureCharacterBot").strip()
 
 MAX_RETRIES = int(os.getenv("MAX_RETRIES", "5"))
 RETRY_BASE_DELAY = int(os.getenv("RETRY_BASE_DELAY", "3"))
@@ -119,6 +120,7 @@ def clear_progress_state() -> None:
         "current_index",
         "sent_count",
         "delay_seconds",
+        "resume_target_count",
     ]:
         data.pop(key, None)
     save_state_data(data)
@@ -133,6 +135,7 @@ def load_progress_state() -> dict:
         "current_index": int(data.get("current_index") or 0),
         "sent_count": int(data.get("sent_count") or 0),
         "delay_seconds": int(data.get("delay_seconds") or DEFAULT_SEND_DELAY),
+        "resume_target_count": int(data.get("resume_target_count") or 0),
     }
 
 
@@ -144,6 +147,7 @@ def save_progress_state(
     current_index: int,
     sent_count: int,
     delay_seconds: int,
+    resume_target_count: int = 0,
 ) -> None:
     data = load_state_data()
     data.update(
@@ -154,6 +158,7 @@ def save_progress_state(
             "current_index": current_index,
             "sent_count": sent_count,
             "delay_seconds": delay_seconds,
+            "resume_target_count": resume_target_count,
         }
     )
     save_state_data(data)
@@ -208,6 +213,36 @@ def parse_delay_from_text(text: str, default_delay: int) -> int:
     return int(parts[1])
 
 
+def parse_resume_count_from_text(text: str) -> int:
+    parts = clean_value(text).split()
+    if len(parts) < 2:
+        raise ValueError("Resume count is required")
+    if not parts[1].isdigit():
+        raise ValueError("Resume count must be a number")
+    resume_count = int(parts[1])
+    if resume_count < 0:
+        raise ValueError("Resume count must be zero or greater")
+    return resume_count
+
+
+def parse_resume_count_and_delay(text: str, default_delay: int) -> tuple[int, int]:
+    parts = clean_value(text).split()
+    if len(parts) < 2:
+        raise ValueError("Resume count is required")
+    if not parts[1].isdigit():
+        raise ValueError("Resume count must be a number")
+    resume_count = int(parts[1])
+
+    if len(parts) >= 3:
+        if not parts[2].isdigit():
+            raise ValueError("Delay must be a number")
+        delay_seconds = int(parts[2])
+    else:
+        delay_seconds = default_delay
+
+    return resume_count, delay_seconds
+
+
 @dataclass
 class RunnerState:
     running: bool = False
@@ -218,6 +253,7 @@ class RunnerState:
     current_index: int = 0
     last_error: str = ""
     source_bot: str = ""
+    resume_target_count: int = 0
 
 
 class InlineSeeder:
@@ -230,16 +266,17 @@ class InlineSeeder:
     def is_running(self) -> bool:
         return self.task is not None and not self.task.done()
 
-    def _load_resume_state_for_bot(self, source_bot: str) -> tuple[str, int, int]:
+    def _load_resume_state_for_bot(self, source_bot: str) -> tuple[str, int, int, int]:
         data = load_progress_state()
         saved_bot = str(data.get("source_bot") or "")
         if not saved_bot or saved_bot != source_bot:
-            return "", 0, 0
+            return "", 0, 0, 0
 
         offset = str(data.get("current_offset") or "")
         index = int(data.get("current_index") or 0)
         sent_count = int(data.get("sent_count") or 0)
-        return offset, index, sent_count
+        resume_target_count = int(data.get("resume_target_count") or sent_count or 0)
+        return offset, index, sent_count, resume_target_count
 
     def _save_resume_state(self, source_bot: str, offset: str, index: int) -> None:
         save_progress_state(
@@ -249,6 +286,7 @@ class InlineSeeder:
             current_index=index,
             sent_count=self.state.sent_count,
             delay_seconds=self.state.delay_seconds,
+            resume_target_count=self.state.resume_target_count,
         )
 
     async def start(self, source_bot: str, delay_seconds: int):
@@ -256,7 +294,7 @@ class InlineSeeder:
             raise RuntimeError("Seeder is already running")
 
         delay_seconds = max(1, min(delay_seconds, MAX_SEND_DELAY))
-        resume_offset, resume_index, resume_sent_count = self._load_resume_state_for_bot(source_bot)
+        resume_offset, resume_index, resume_sent_count, resume_target_count = self._load_resume_state_for_bot(source_bot)
 
         self.stop_event = asyncio.Event()
         self.state = RunnerState(
@@ -268,7 +306,30 @@ class InlineSeeder:
             current_index=resume_index,
             last_error="",
             source_bot=source_bot,
+            resume_target_count=resume_target_count,
         )
+        self.task = asyncio.create_task(self._worker(source_bot))
+
+    async def force_resume(self, source_bot: str, resume_count: int, delay_seconds: int):
+        if self.is_running():
+            raise RuntimeError("Seeder is already running")
+
+        delay_seconds = max(1, min(delay_seconds, MAX_SEND_DELAY))
+        offset, index = await self._locate_cursor_for_resume_count(source_bot, resume_count)
+
+        self.stop_event = asyncio.Event()
+        self.state = RunnerState(
+            running=True,
+            sent_count=resume_count,
+            delay_seconds=delay_seconds,
+            target_chat=RESOLVED_TARGET_CHAT,
+            current_offset=offset,
+            current_index=index,
+            last_error="",
+            source_bot=source_bot,
+            resume_target_count=resume_count,
+        )
+        self._save_resume_state(source_bot, offset, index)
         self.task = asyncio.create_task(self._worker(source_bot))
 
     async def stop(self):
@@ -346,6 +407,88 @@ class InlineSeeder:
                 raise
 
         raise RuntimeError(f"get_inline_bot_results failed after {MAX_RETRIES} retries: {last_exc}")
+
+    async def _retry_get_inline_results_seek(self, source_bot: str, offset: str):
+        last_exc: Optional[Exception] = None
+
+        for attempt in range(1, MAX_RETRIES + 1):
+            try:
+                return await self.client.get_inline_bot_results(
+                    bot=source_bot,
+                    query="",
+                    offset=offset,
+                )
+
+            except FloodWait as e:
+                wait_for = int(getattr(e, "value", getattr(e, "x", 5)))
+                logger.warning(
+                    "FloodWait while locating resume cursor from %s | attempt %s/%s | waiting %ss",
+                    source_bot,
+                    attempt,
+                    MAX_RETRIES,
+                    wait_for,
+                )
+                await asyncio.sleep(wait_for + 1)
+                last_exc = e
+
+            except (RPCError, OSError, TimeoutError) as e:
+                delay = self._backoff_delay(attempt)
+                logger.warning(
+                    "Cursor locate get_inline_bot_results failed from %s | attempt %s/%s | retry in %ss | error=%s",
+                    source_bot,
+                    attempt,
+                    MAX_RETRIES,
+                    delay,
+                    e,
+                )
+                last_exc = e
+                if attempt < MAX_RETRIES:
+                    await asyncio.sleep(delay)
+                else:
+                    break
+
+            except Exception:
+                logger.exception("Unexpected cursor locate error")
+                raise
+
+        raise RuntimeError(f"Failed to locate resume cursor after {MAX_RETRIES} retries: {last_exc}")
+
+    async def _locate_cursor_for_resume_count(self, source_bot: str, resume_count: int) -> tuple[str, int]:
+        if resume_count <= 0:
+            return "", 0
+
+        offset = ""
+        seen = 0
+
+        while True:
+            results = await self._retry_get_inline_results_seek(source_bot, offset)
+            page_len = len(results.results)
+
+            if page_len <= 0:
+                raise RuntimeError("No inline results found for requested source bot")
+
+            if seen + page_len > resume_count:
+                index = resume_count - seen
+                logger.info(
+                    "Force resume cursor located | source_bot=%s | resume_count=%s | page_offset=%r | page_index=%s",
+                    source_bot,
+                    resume_count,
+                    offset,
+                    index,
+                )
+                return offset, index
+
+            seen += page_len
+            next_offset = results.next_offset or ""
+
+            if not next_offset:
+                if seen == resume_count:
+                    raise RuntimeError("Requested resume count is already at the end of available inline results")
+                raise RuntimeError(
+                    f"Requested resume count {resume_count} exceeds available inline results ({seen})"
+                )
+
+            offset = next_offset
 
     async def _retry_send_inline_result(self, source_bot: str, results, result_id: str):
         last_exc: Optional[Exception] = None
@@ -507,6 +650,7 @@ class InlineSeeder:
                 f"Sent count: {self.state.sent_count}\n"
                 f"Current offset: {self.state.current_offset or '-'}\n"
                 f"Current index: {self.state.current_index}\n"
+                f"Resume target count: {self.state.resume_target_count}\n"
                 f"Last error: {self.state.last_error or 'unknown'}"
             )
             await self._notify_target_chat_error(error_text)
@@ -583,6 +727,7 @@ async def execute_control_command(message: Message) -> None:
             f"Target chat: {target_chat_display()}\n"
             f"Catcher: {CATCHER_INLINE_BOT}\n"
             f"Seizer: {SEIZER_INLINE_BOT}\n"
+            f"Capture: {CAPTURE_INLINE_BOT}\n"
             f"Default delay: {DEFAULT_SEND_DELAY}s\n"
             f"Max retries: {MAX_RETRIES}\n"
             f"Retry base delay: {RETRY_BASE_DELAY}s\n"
@@ -593,6 +738,11 @@ async def execute_control_command(message: Message) -> None:
             "/startcatcherbot 5\n"
             "/startseizerbot\n"
             "/startseizerbot 10\n"
+            "/startcapturebot\n"
+            "/startcapturebot 8\n"
+            "/resumecatcherbot 2422\n"
+            "/resumeseizerbot 2422\n"
+            "/resumecapturebot 2422\n"
             "/stopinlinebot\n"
             "/resetinlineprogress\n"
             "/status",
@@ -612,6 +762,7 @@ async def execute_control_command(message: Message) -> None:
             f"Sent count: {state.sent_count}\n"
             f"Current offset: {state.current_offset or '-'}\n"
             f"Current index: {state.current_index}\n"
+            f"Resume target count: {state.resume_target_count}\n"
             f"Last error: {state.last_error or '-'}",
             reply_to_message_id=message.id,
         )
@@ -670,6 +821,65 @@ async def execute_control_command(message: Message) -> None:
         )
         return
 
+    if cmd == "/startcapturebot":
+        delay_seconds = parse_delay_from_text(text, DEFAULT_SEND_DELAY)
+        await SEEDER.start(CAPTURE_INLINE_BOT, delay_seconds)
+        await send_control_reply(
+            "Started.\n"
+            f"Source bot: {CAPTURE_INLINE_BOT}\n"
+            f"Target chat: {target_chat_display()}\n"
+            f"Delay: {delay_seconds}s\n"
+            f"Resume from offset: {SEEDER.state.current_offset or '-'}\n"
+            f"Resume from index: {SEEDER.state.current_index}",
+            reply_to_message_id=message.id,
+        )
+        return
+
+    if cmd == "/resumecatcherbot":
+        resume_count, delay_seconds = parse_resume_count_and_delay(text, DEFAULT_SEND_DELAY)
+        await SEEDER.force_resume(CATCHER_INLINE_BOT, resume_count, delay_seconds)
+        await send_control_reply(
+            "Force resume started.\n"
+            f"Source bot: {CATCHER_INLINE_BOT}\n"
+            f"Target chat: {target_chat_display()}\n"
+            f"Resume from count: {resume_count}\n"
+            f"Delay: {delay_seconds}s\n"
+            f"Resolved offset: {SEEDER.state.current_offset or '-'}\n"
+            f"Resolved index: {SEEDER.state.current_index}",
+            reply_to_message_id=message.id,
+        )
+        return
+
+    if cmd == "/resumeseizerbot":
+        resume_count, delay_seconds = parse_resume_count_and_delay(text, DEFAULT_SEND_DELAY)
+        await SEEDER.force_resume(SEIZER_INLINE_BOT, resume_count, delay_seconds)
+        await send_control_reply(
+            "Force resume started.\n"
+            f"Source bot: {SEIZER_INLINE_BOT}\n"
+            f"Target chat: {target_chat_display()}\n"
+            f"Resume from count: {resume_count}\n"
+            f"Delay: {delay_seconds}s\n"
+            f"Resolved offset: {SEEDER.state.current_offset or '-'}\n"
+            f"Resolved index: {SEEDER.state.current_index}",
+            reply_to_message_id=message.id,
+        )
+        return
+
+    if cmd == "/resumecapturebot":
+        resume_count, delay_seconds = parse_resume_count_and_delay(text, DEFAULT_SEND_DELAY)
+        await SEEDER.force_resume(CAPTURE_INLINE_BOT, resume_count, delay_seconds)
+        await send_control_reply(
+            "Force resume started.\n"
+            f"Source bot: {CAPTURE_INLINE_BOT}\n"
+            f"Target chat: {target_chat_display()}\n"
+            f"Resume from count: {resume_count}\n"
+            f"Delay: {delay_seconds}s\n"
+            f"Resolved offset: {SEEDER.state.current_offset or '-'}\n"
+            f"Resolved index: {SEEDER.state.current_index}",
+            reply_to_message_id=message.id,
+        )
+        return
+
 
 async def control_loop(stop_event: asyncio.Event) -> None:
     known_commands = {
@@ -677,6 +887,10 @@ async def control_loop(stop_event: asyncio.Event) -> None:
         "/status",
         "/startcatcherbot",
         "/startseizerbot",
+        "/startcapturebot",
+        "/resumecatcherbot",
+        "/resumeseizerbot",
+        "/resumecapturebot",
         "/stopinlinebot",
         "/resetinlineprogress",
     }
