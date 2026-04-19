@@ -631,19 +631,18 @@ async def main():
 
     me = await app.get_me()
     logger.info("User session started as %s (%s)", me.first_name, me.id)
-    logger.info("Target chat: %r", RESOLVED_TARGET_CHAT)
+    logger.info("Target chat: %r", DEFAULT_TARGET_CHAT)
     logger.info("Owner IDs: %s", sorted(OWNER_IDS))
-    
+
     try:
-    await app.send_message(DEFAULT_TARGET_CHAT, "AddHelper online ✅")
-    logger.info("Startup test message sent to target chat")
+        await app.send_message(DEFAULT_TARGET_CHAT, "AddHelper online ✅")
+        logger.info("Startup test message sent to target chat")
     except Exception as e:
-    logger.error("Startup test message failed: %s", e)
+        logger.error("Startup test message failed: %s", e)
 
     stop_event = asyncio.Event()
 
-    def _stop():
-        logger.info("Stop signal received")
+    def _stop(*_args):
         stop_event.set()
 
     loop = asyncio.get_running_loop()
@@ -653,7 +652,16 @@ async def main():
         except NotImplementedError:
             pass
 
-    await stop_event.wait()
+    idle_task = asyncio.create_task(idle())
+    stop_task = asyncio.create_task(stop_event.wait())
+
+    done, pending = await asyncio.wait(
+        {idle_task, stop_task},
+        return_when=asyncio.FIRST_COMPLETED,
+    )
+
+    for task in pending:
+        task.cancel()
 
     if SEEDER.is_running():
         await SEEDER.stop()
@@ -662,7 +670,4 @@ async def main():
 
 
 if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        pass
+    asyncio.run(main())
