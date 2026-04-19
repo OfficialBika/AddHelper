@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Optional
 
 from dotenv import load_dotenv
-from pyrogram import Client, filters, idle
+from pyrogram import Client
 from pyrogram.errors import FloodWait, RPCError
 from pyrogram.types import Message
 
@@ -33,6 +33,9 @@ SEIZER_INLINE_BOT = os.getenv("SEIZER_INLINE_BOT", "@Character_Seizer_Bot").stri
 
 MAX_RETRIES = int(os.getenv("MAX_RETRIES", "5"))
 RETRY_BASE_DELAY = int(os.getenv("RETRY_BASE_DELAY", "3"))
+
+CONTROL_POLL_INTERVAL = float(os.getenv("CONTROL_POLL_INTERVAL", "2"))
+CONTROL_HISTORY_LIMIT = int(os.getenv("CONTROL_HISTORY_LIMIT", "20"))
 
 STATE_FILE = os.getenv("STATE_FILE", "seeder_state.json").strip()
 CLEAR_STATE_ON_FINISH = os.getenv("CLEAR_STATE_ON_FINISH", "true").lower() == "true"
@@ -85,7 +88,7 @@ def _state_path() -> Path:
     return Path(STATE_FILE)
 
 
-def load_progress_state() -> dict:
+def load_state_data() -> dict:
     path = _state_path()
     if not path.exists():
         return {}
@@ -96,7 +99,7 @@ def load_progress_state() -> dict:
         return {}
 
 
-def save_progress_state(data: dict) -> None:
+def save_state_data(data: dict) -> None:
     path = _state_path()
     try:
         path.write_text(
@@ -108,12 +111,63 @@ def save_progress_state(data: dict) -> None:
 
 
 def clear_progress_state() -> None:
-    path = _state_path()
-    try:
-        if path.exists():
-            path.unlink()
-    except Exception:
-        logger.exception("Failed to clear state file")
+    data = load_state_data()
+    for key in [
+        "source_bot",
+        "target_chat",
+        "current_offset",
+        "current_index",
+        "sent_count",
+        "delay_seconds",
+    ]:
+        data.pop(key, None)
+    save_state_data(data)
+
+
+def load_progress_state() -> dict:
+    data = load_state_data()
+    return {
+        "source_bot": str(data.get("source_bot") or ""),
+        "target_chat": data.get("target_chat"),
+        "current_offset": str(data.get("current_offset") or ""),
+        "current_index": int(data.get("current_index") or 0),
+        "sent_count": int(data.get("sent_count") or 0),
+        "delay_seconds": int(data.get("delay_seconds") or DEFAULT_SEND_DELAY),
+    }
+
+
+def save_progress_state(
+    *,
+    source_bot: str,
+    target_chat: str | int,
+    current_offset: str,
+    current_index: int,
+    sent_count: int,
+    delay_seconds: int,
+) -> None:
+    data = load_state_data()
+    data.update(
+        {
+            "source_bot": source_bot,
+            "target_chat": str(target_chat),
+            "current_offset": current_offset,
+            "current_index": current_index,
+            "sent_count": sent_count,
+            "delay_seconds": delay_seconds,
+        }
+    )
+    save_state_data(data)
+
+
+def load_control_last_msg_id() -> int:
+    data = load_state_data()
+    return int(data.get("control_last_msg_id") or 0)
+
+
+def save_control_last_msg_id(message_id: int) -> None:
+    data = load_state_data()
+    data["control_last_msg_id"] = int(message_id)
+    save_state_data(data)
 
 
 def is_target_chat_message(message: Message) -> bool:
@@ -141,6 +195,19 @@ def is_owner_or_self_message(message: Message) -> bool:
     return False
 
 
+def command_name(text: str) -> str:
+    return clean_value(text).split()[0].lower() if clean_value(text) else ""
+
+
+def parse_delay_from_text(text: str, default_delay: int) -> int:
+    parts = clean_value(text).split()
+    if len(parts) < 2:
+        return default_delay
+    if not parts[1].isdigit():
+        raise ValueError("Delay must be a number")
+    return int(parts[1])
+
+
 @dataclass
 class RunnerState:
     running: bool = False
@@ -166,7 +233,7 @@ class InlineSeeder:
     def _load_resume_state_for_bot(self, source_bot: str) -> tuple[str, int, int]:
         data = load_progress_state()
         saved_bot = str(data.get("source_bot") or "")
-        if not data or saved_bot != source_bot:
+        if not saved_bot or saved_bot != source_bot:
             return "", 0, 0
 
         offset = str(data.get("current_offset") or "")
@@ -176,14 +243,12 @@ class InlineSeeder:
 
     def _save_resume_state(self, source_bot: str, offset: str, index: int) -> None:
         save_progress_state(
-            {
-                "source_bot": source_bot,
-                "target_chat": str(RESOLVED_TARGET_CHAT),
-                "current_offset": offset,
-                "current_index": index,
-                "sent_count": self.state.sent_count,
-                "delay_seconds": self.state.delay_seconds,
-            }
+            source_bot=source_bot,
+            target_chat=RESOLVED_TARGET_CHAT,
+            current_offset=offset,
+            current_index=index,
+            sent_count=self.state.sent_count,
+            delay_seconds=self.state.delay_seconds,
         )
 
     async def start(self, source_bot: str, delay_seconds: int):
@@ -467,19 +532,6 @@ app = Client(
 SEEDER = InlineSeeder(app)
 
 
-def parse_delay_from_text(text: str, default_delay: int) -> int:
-    parts = clean_value(text).split()
-    if len(parts) < 2:
-        return default_delay
-    if not parts[1].isdigit():
-        raise ValueError("Delay must be a number")
-    return int(parts[1])
-
-
-def command_name(text: str) -> str:
-    return clean_value(text).split()[0].lower() if clean_value(text) else ""
-
-
 async def warmup_client_peers(client: Client) -> None:
     global RESOLVED_TARGET_CHAT
 
@@ -504,122 +556,208 @@ async def warmup_client_peers(client: Client) -> None:
         ) from e
 
 
-@app.on_message(filters.text & (filters.me | filters.user(list(OWNER_IDS))))
-async def command_handler(client: Client, message: Message):
+async def send_control_reply(text: str, reply_to_message_id: Optional[int] = None) -> None:
+    await app.send_message(
+        chat_id=RESOLVED_TARGET_CHAT,
+        text=text,
+        reply_to_message_id=reply_to_message_id,
+    )
+
+
+async def execute_control_command(message: Message) -> None:
     text = clean_value(message.text or "")
-    chat_id = getattr(message.chat, "id", None)
-    user_id = getattr(message.from_user, "id", None) if message.from_user else None
+    cmd = command_name(text)
 
     logger.info(
-        "SEEN MSG | chat_id=%s | user_id=%s | outgoing=%s | text=%r",
-        chat_id,
-        user_id,
+        "CONTROL CMD | msg_id=%s | user_id=%s | outgoing=%s | text=%r",
+        message.id,
+        getattr(message.from_user, "id", None) if message.from_user else None,
         getattr(message, "outgoing", False),
         text,
     )
 
-    if not is_target_chat_message(message):
-        logger.info("IGNORED OTHER CHAT | chat_id=%s | text=%r", chat_id, text)
+    if cmd == "/start":
+        await send_control_reply(
+            "Inline Seeder ready.\n\n"
+            f"Mode: userbot only\n"
+            f"Target chat: {target_chat_display()}\n"
+            f"Catcher: {CATCHER_INLINE_BOT}\n"
+            f"Seizer: {SEIZER_INLINE_BOT}\n"
+            f"Default delay: {DEFAULT_SEND_DELAY}s\n"
+            f"Max retries: {MAX_RETRIES}\n"
+            f"Retry base delay: {RETRY_BASE_DELAY}s\n"
+            f"State file: {STATE_FILE}\n"
+            f"Sessions dir: {SESSIONS_DIR}\n\n"
+            "Commands:\n"
+            "/startcatcherbot\n"
+            "/startcatcherbot 5\n"
+            "/startseizerbot\n"
+            "/startseizerbot 10\n"
+            "/stopinlinebot\n"
+            "/resetinlineprogress\n"
+            "/status",
+            reply_to_message_id=message.id,
+        )
         return
 
-    cmd = command_name(text)
+    if cmd == "/status":
+        me = await app.get_me()
+        state = SEEDER.state
+        await send_control_reply(
+            f"Running: {'YES' if SEEDER.is_running() else 'NO'}\n"
+            f"User session: {me.first_name or ''} ({me.id})\n"
+            f"Source bot: {state.source_bot or '-'}\n"
+            f"Target chat: {state.target_chat}\n"
+            f"Delay: {state.delay_seconds}s\n"
+            f"Sent count: {state.sent_count}\n"
+            f"Current offset: {state.current_offset or '-'}\n"
+            f"Current index: {state.current_index}\n"
+            f"Last error: {state.last_error or '-'}",
+            reply_to_message_id=message.id,
+        )
+        return
 
-    if cmd not in {
+    if cmd == "/stopinlinebot":
+        stopped = await SEEDER.stop()
+        if not stopped:
+            await send_control_reply("Seeder is not running.", reply_to_message_id=message.id)
+            return
+        await send_control_reply(
+            f"Stopped.\nSent count: {SEEDER.state.sent_count}",
+            reply_to_message_id=message.id,
+        )
+        return
+
+    if cmd == "/resetinlineprogress":
+        if SEEDER.is_running():
+            await send_control_reply(
+                "Seeder running ဖြစ်နေပါတယ်။ အရင် /stopinlinebot လုပ်ပါ။",
+                reply_to_message_id=message.id,
+            )
+            return
+        clear_progress_state()
+        await send_control_reply(
+            "Inline progress state cleared.",
+            reply_to_message_id=message.id,
+        )
+        return
+
+    if cmd == "/startcatcherbot":
+        delay_seconds = parse_delay_from_text(text, DEFAULT_SEND_DELAY)
+        await SEEDER.start(CATCHER_INLINE_BOT, delay_seconds)
+        await send_control_reply(
+            "Started.\n"
+            f"Source bot: {CATCHER_INLINE_BOT}\n"
+            f"Target chat: {target_chat_display()}\n"
+            f"Delay: {delay_seconds}s\n"
+            f"Resume from offset: {SEEDER.state.current_offset or '-'}\n"
+            f"Resume from index: {SEEDER.state.current_index}",
+            reply_to_message_id=message.id,
+        )
+        return
+
+    if cmd == "/startseizerbot":
+        delay_seconds = parse_delay_from_text(text, DEFAULT_SEND_DELAY)
+        await SEEDER.start(SEIZER_INLINE_BOT, delay_seconds)
+        await send_control_reply(
+            "Started.\n"
+            f"Source bot: {SEIZER_INLINE_BOT}\n"
+            f"Target chat: {target_chat_display()}\n"
+            f"Delay: {delay_seconds}s\n"
+            f"Resume from offset: {SEEDER.state.current_offset or '-'}\n"
+            f"Resume from index: {SEEDER.state.current_index}",
+            reply_to_message_id=message.id,
+        )
+        return
+
+
+async def control_loop(stop_event: asyncio.Event) -> None:
+    known_commands = {
         "/start",
         "/status",
         "/startcatcherbot",
         "/startseizerbot",
         "/stopinlinebot",
         "/resetinlineprogress",
-    }:
-        logger.info("IGNORED UNKNOWN CMD | user_id=%s | text=%r", user_id, text)
+    }
+
+    while not stop_event.is_set():
+        try:
+            last_seen_id = load_control_last_msg_id()
+            messages = []
+
+            async for msg in app.get_chat_history(
+                RESOLVED_TARGET_CHAT,
+                limit=CONTROL_HISTORY_LIMIT,
+            ):
+                messages.append(msg)
+
+            if messages:
+                messages.reverse()
+                newest_id = last_seen_id
+
+                for msg in messages:
+                    newest_id = max(newest_id, int(msg.id))
+
+                    if msg.id <= last_seen_id:
+                        continue
+
+                    text = clean_value(msg.text or "")
+                    cmd = command_name(text)
+
+                    logger.info(
+                        "SCAN MSG | msg_id=%s | user_id=%s | outgoing=%s | text=%r",
+                        msg.id,
+                        getattr(msg.from_user, "id", None) if msg.from_user else None,
+                        getattr(msg, "outgoing", False),
+                        text,
+                    )
+
+                    if not text:
+                        continue
+
+                    if not is_owner_or_self_message(msg):
+                        continue
+
+                    if cmd not in known_commands:
+                        continue
+
+                    try:
+                        await execute_control_command(msg)
+                    except Exception as e:
+                        logger.exception("CONTROL COMMAND ERROR")
+                        await send_control_reply(
+                            f"Error: {e}",
+                            reply_to_message_id=msg.id,
+                        )
+
+                if newest_id > last_seen_id:
+                    save_control_last_msg_id(newest_id)
+
+        except Exception:
+            logger.exception("control_loop failed")
+
+        try:
+            await asyncio.wait_for(stop_event.wait(), timeout=CONTROL_POLL_INTERVAL)
+        except asyncio.TimeoutError:
+            pass
+
+
+async def initialize_control_cursor() -> None:
+    last_seen_id = load_control_last_msg_id()
+    if last_seen_id > 0:
+        logger.info("Control cursor restored at msg_id=%s", last_seen_id)
         return
 
-    try:
-        if cmd == "/start":
-            await message.reply(
-                "Inline Seeder ready.\n\n"
-                f"Mode: userbot only\n"
-                f"Target chat: {target_chat_display()}\n"
-                f"Catcher: {CATCHER_INLINE_BOT}\n"
-                f"Seizer: {SEIZER_INLINE_BOT}\n"
-                f"Default delay: {DEFAULT_SEND_DELAY}s\n"
-                f"Max retries: {MAX_RETRIES}\n"
-                f"Retry base delay: {RETRY_BASE_DELAY}s\n"
-                f"State file: {STATE_FILE}\n"
-                f"Sessions dir: {SESSIONS_DIR}\n\n"
-                "Commands:\n"
-                "/startcatcherbot\n"
-                "/startcatcherbot 5\n"
-                "/startseizerbot\n"
-                "/startseizerbot 10\n"
-                "/stopinlinebot\n"
-                "/resetinlineprogress\n"
-                "/status"
-            )
-            return
+    latest_id = 0
+    async for msg in app.get_chat_history(RESOLVED_TARGET_CHAT, limit=1):
+        latest_id = int(msg.id)
+        break
 
-        if cmd == "/status":
-            me = await client.get_me()
-            state = SEEDER.state
-            await message.reply(
-                f"Running: {'YES' if SEEDER.is_running() else 'NO'}\n"
-                f"User session: {me.first_name or ''} ({me.id})\n"
-                f"Source bot: {state.source_bot or '-'}\n"
-                f"Target chat: {state.target_chat}\n"
-                f"Delay: {state.delay_seconds}s\n"
-                f"Sent count: {state.sent_count}\n"
-                f"Current offset: {state.current_offset or '-'}\n"
-                f"Current index: {state.current_index}\n"
-                f"Last error: {state.last_error or '-'}"
-            )
-            return
+    if latest_id > 0:
+        save_control_last_msg_id(latest_id)
+        logger.info("Control cursor initialized at latest msg_id=%s", latest_id)
 
-        if cmd == "/stopinlinebot":
-            stopped = await SEEDER.stop()
-            if not stopped:
-                await message.reply("Seeder is not running.")
-                return
-            await message.reply(f"Stopped.\nSent count: {SEEDER.state.sent_count}")
-            return
-
-        if cmd == "/resetinlineprogress":
-            if SEEDER.is_running():
-                await message.reply("Seeder running ဖြစ်နေပါတယ်။ အရင် /stopinlinebot လုပ်ပါ။")
-                return
-            clear_progress_state()
-            await message.reply("Inline progress state cleared.")
-            return
-
-        if cmd == "/startcatcherbot":
-            delay_seconds = parse_delay_from_text(text, DEFAULT_SEND_DELAY)
-            await SEEDER.start(CATCHER_INLINE_BOT, delay_seconds)
-            await message.reply(
-                "Started.\n"
-                f"Source bot: {CATCHER_INLINE_BOT}\n"
-                f"Target chat: {target_chat_display()}\n"
-                f"Delay: {delay_seconds}s\n"
-                f"Resume from offset: {SEEDER.state.current_offset or '-'}\n"
-                f"Resume from index: {SEEDER.state.current_index}"
-            )
-            return
-
-        if cmd == "/startseizerbot":
-            delay_seconds = parse_delay_from_text(text, DEFAULT_SEND_DELAY)
-            await SEEDER.start(SEIZER_INLINE_BOT, delay_seconds)
-            await message.reply(
-                "Started.\n"
-                f"Source bot: {SEIZER_INLINE_BOT}\n"
-                f"Target chat: {target_chat_display()}\n"
-                f"Delay: {delay_seconds}s\n"
-                f"Resume from offset: {SEEDER.state.current_offset or '-'}\n"
-                f"Resume from index: {SEEDER.state.current_index}"
-            )
-            return
-
-    except Exception as e:
-        logger.exception("COMMAND ERROR")
-        await message.reply(f"Error: {e}")
 
 async def main():
     await app.start()
@@ -636,6 +774,8 @@ async def main():
     except Exception as e:
         logger.error("Startup test message failed: %s", e)
 
+    await initialize_control_cursor()
+
     stop_event = asyncio.Event()
 
     def _stop(*_args):
@@ -648,21 +788,24 @@ async def main():
         except NotImplementedError:
             pass
 
-    idle_task = asyncio.create_task(idle())
-    stop_task = asyncio.create_task(stop_event.wait())
+    control_task = asyncio.create_task(control_loop(stop_event))
 
-    done, pending = await asyncio.wait(
-        {idle_task, stop_task},
-        return_when=asyncio.FIRST_COMPLETED,
-    )
+    try:
+        while not stop_event.is_set():
+            await asyncio.sleep(1)
+    finally:
+        control_task.cancel()
+        try:
+            await control_task
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            logger.exception("control_task shutdown failed")
 
-    for task in pending:
-        task.cancel()
+        if SEEDER.is_running():
+            await SEEDER.stop()
 
-    if SEEDER.is_running():
-        await SEEDER.stop()
-
-    await app.stop()
+        await app.stop()
 
 
 if __name__ == "__main__":
