@@ -504,25 +504,22 @@ async def warmup_client_peers(client: Client) -> None:
         ) from e
 
 
-@app.on_message(filters.text)
+@app.on_message(filters.text & (filters.me | filters.user(list(OWNER_IDS))))
 async def command_handler(client: Client, message: Message):
     text = clean_value(message.text or "")
     chat_id = getattr(message.chat, "id", None)
     user_id = getattr(message.from_user, "id", None) if message.from_user else None
 
-    if is_target_chat_message(message):
-        logger.info(
-            "TARGET MSG | chat_id=%s | user_id=%s | text=%r",
-            chat_id,
-            user_id,
-            text,
-        )
+    logger.info(
+        "SEEN MSG | chat_id=%s | user_id=%s | outgoing=%s | text=%r",
+        chat_id,
+        user_id,
+        getattr(message, "outgoing", False),
+        text,
+    )
 
     if not is_target_chat_message(message):
-        return
-
-    if not is_owner_or_self_message(message):
-        logger.info("IGNORED NON-OWNER | user_id=%s | text=%r", user_id, text)
+        logger.info("IGNORED OTHER CHAT | chat_id=%s | text=%r", chat_id, text)
         return
 
     cmd = command_name(text)
@@ -623,7 +620,6 @@ async def command_handler(client: Client, message: Message):
     except Exception as e:
         logger.exception("COMMAND ERROR")
         await message.reply(f"Error: {e}")
-
 
 async def main():
     await app.start()
