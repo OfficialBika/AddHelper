@@ -31,6 +31,8 @@ MAX_SEND_DELAY = int(os.getenv("MAX_SEND_DELAY", "30"))
 CATCHER_INLINE_BOT = os.getenv("CATCHER_INLINE_BOT", "@Character_Catcher_Bot").strip()
 SEIZER_INLINE_BOT = os.getenv("SEIZER_INLINE_BOT", "@Character_Seizer_Bot").strip()
 CAPTURE_INLINE_BOT = os.getenv("CAPTURE_INLINE_BOT", "@CaptureCharacterBot").strip()
+FW_SEIZER_SOURCE_CHAT = os.getenv("FW_SEIZER_SOURCE_CHAT", "@Seizer_Database").strip()
+FW_CAPTURE_SOURCE_CHAT = os.getenv("FW_CAPTURE_SOURCE_CHAT", "@CaptureDatabase").strip()
 
 MAX_RETRIES = int(os.getenv("MAX_RETRIES", "5"))
 RETRY_BASE_DELAY = int(os.getenv("RETRY_BASE_DELAY", "3"))
@@ -114,6 +116,8 @@ def save_state_data(data: dict) -> None:
 def clear_progress_state() -> None:
     data = load_state_data()
     for key in [
+        "runner_mode",
+        "source_ref",
         "source_bot",
         "target_chat",
         "current_offset",
@@ -129,7 +133,9 @@ def clear_progress_state() -> None:
 def load_progress_state() -> dict:
     data = load_state_data()
     return {
-        "source_bot": str(data.get("source_bot") or ""),
+        "runner_mode": str(data.get("runner_mode") or "inline"),
+        "source_ref": str(data.get("source_ref") or data.get("source_bot") or ""),
+        "source_bot": str(data.get("source_bot") or data.get("source_ref") or ""),
         "target_chat": data.get("target_chat"),
         "current_offset": str(data.get("current_offset") or ""),
         "current_index": int(data.get("current_index") or 0),
@@ -141,7 +147,8 @@ def load_progress_state() -> dict:
 
 def save_progress_state(
     *,
-    source_bot: str,
+    runner_mode: str,
+    source_ref: str,
     target_chat: str | int,
     current_offset: str,
     current_index: int,
@@ -152,7 +159,9 @@ def save_progress_state(
     data = load_state_data()
     data.update(
         {
-            "source_bot": source_bot,
+            "runner_mode": runner_mode,
+            "source_ref": source_ref,
+            "source_bot": source_ref,
             "target_chat": str(target_chat),
             "current_offset": current_offset,
             "current_index": current_index,
@@ -246,6 +255,7 @@ def parse_resume_count_and_delay(text: str, default_delay: int) -> tuple[int, in
 @dataclass
 class RunnerState:
     running: bool = False
+    runner_mode: str = "inline"
     sent_count: int = 0
     delay_seconds: int = DEFAULT_SEND_DELAY
     target_chat: str | int = DEFAULT_TARGET_CHAT
@@ -266,10 +276,11 @@ class InlineSeeder:
     def is_running(self) -> bool:
         return self.task is not None and not self.task.done()
 
-    def _load_resume_state_for_bot(self, source_bot: str) -> tuple[str, int, int, int]:
+    def _load_resume_state_for_source(self, runner_mode: str, source_ref: str) -> tuple[str, int, int, int]:
         data = load_progress_state()
-        saved_bot = str(data.get("source_bot") or "")
-        if not saved_bot or saved_bot != source_bot:
+        saved_mode = str(data.get("runner_mode") or "inline")
+        saved_ref = str(data.get("source_ref") or data.get("source_bot") or "")
+        if not saved_ref or saved_mode != runner_mode or saved_ref != source_ref:
             return "", 0, 0, 0
 
         offset = str(data.get("current_offset") or "")
@@ -278,9 +289,10 @@ class InlineSeeder:
         resume_target_count = int(data.get("resume_target_count") or sent_count or 0)
         return offset, index, sent_count, resume_target_count
 
-    def _save_resume_state(self, source_bot: str, offset: str, index: int) -> None:
+    def _save_resume_state(self, source_ref: str, offset: str, index: int) -> None:
         save_progress_state(
-            source_bot=source_bot,
+            runner_mode=self.state.runner_mode,
+            source_ref=source_ref,
             target_chat=RESOLVED_TARGET_CHAT,
             current_offset=offset,
             current_index=index,
@@ -290,15 +302,25 @@ class InlineSeeder:
         )
 
     async def start(self, source_bot: str, delay_seconds: int):
+        await self.start_inline(source_bot, delay_seconds)
+
+    async def force_resume(self, source_bot: str, resume_count: int, delay_seconds: int):
+        await self.force_resume_inline(source_bot, resume_count, delay_seconds)
+
+    async def start_inline(self, source_bot: str, delay_seconds: int):
         if self.is_running():
             raise RuntimeError("Seeder is already running")
 
         delay_seconds = max(1, min(delay_seconds, MAX_SEND_DELAY))
-        resume_offset, resume_index, resume_sent_count, resume_target_count = self._load_resume_state_for_bot(source_bot)
+        resume_offset, resume_index, resume_sent_count, resume_target_count = self._load_resume_state_for_source(
+            "inline",
+            source_bot,
+        )
 
         self.stop_event = asyncio.Event()
         self.state = RunnerState(
             running=True,
+            runner_mode="inline",
             sent_count=resume_sent_count,
             delay_seconds=delay_seconds,
             target_chat=RESOLVED_TARGET_CHAT,
@@ -308,9 +330,9 @@ class InlineSeeder:
             source_bot=source_bot,
             resume_target_count=resume_target_count,
         )
-        self.task = asyncio.create_task(self._worker(source_bot))
+        self.task = asyncio.create_task(self._worker_inline(source_bot))
 
-    async def force_resume(self, source_bot: str, resume_count: int, delay_seconds: int):
+    async def force_resume_inline(self, source_bot: str, resume_count: int, delay_seconds: int):
         if self.is_running():
             raise RuntimeError("Seeder is already running")
 
@@ -320,6 +342,7 @@ class InlineSeeder:
         self.stop_event = asyncio.Event()
         self.state = RunnerState(
             running=True,
+            runner_mode="inline",
             sent_count=resume_count,
             delay_seconds=delay_seconds,
             target_chat=RESOLVED_TARGET_CHAT,
@@ -330,7 +353,70 @@ class InlineSeeder:
             resume_target_count=resume_count,
         )
         self._save_resume_state(source_bot, offset, index)
-        self.task = asyncio.create_task(self._worker(source_bot))
+        self.task = asyncio.create_task(self._worker_inline(source_bot))
+
+    async def start_forward(self, source_chat: str, delay_seconds: int):
+        if self.is_running():
+            raise RuntimeError("Seeder is already running")
+
+        delay_seconds = max(1, min(delay_seconds, MAX_SEND_DELAY))
+        _, resume_index, resume_sent_count, resume_target_count = self._load_resume_state_for_source(
+            "forward",
+            source_chat,
+        )
+        media_ids = await self._retry_collect_forward_media_ids(source_chat)
+        if not media_ids:
+            raise RuntimeError(f"No photo/video posts found in {source_chat}")
+        if resume_index > len(media_ids):
+            resume_index = len(media_ids)
+            resume_sent_count = min(resume_sent_count, len(media_ids))
+            resume_target_count = min(resume_target_count, len(media_ids))
+
+        self.stop_event = asyncio.Event()
+        self.state = RunnerState(
+            running=True,
+            runner_mode="forward",
+            sent_count=resume_sent_count,
+            delay_seconds=delay_seconds,
+            target_chat=RESOLVED_TARGET_CHAT,
+            current_offset="",
+            current_index=resume_index,
+            last_error="",
+            source_bot=source_chat,
+            resume_target_count=resume_target_count,
+        )
+        self.task = asyncio.create_task(self._worker_forward(source_chat, media_ids))
+
+    async def force_resume_forward(self, source_chat: str, resume_count: int, delay_seconds: int):
+        if self.is_running():
+            raise RuntimeError("Seeder is already running")
+
+        delay_seconds = max(1, min(delay_seconds, MAX_SEND_DELAY))
+        media_ids = await self._retry_collect_forward_media_ids(source_chat)
+        if not media_ids:
+            raise RuntimeError(f"No photo/video posts found in {source_chat}")
+        if resume_count > len(media_ids):
+            raise RuntimeError(
+                f"Requested resume count {resume_count} exceeds available forward media posts ({len(media_ids)})"
+            )
+        if resume_count == len(media_ids):
+            raise RuntimeError("Requested resume count is already at the end of available forward media posts")
+
+        self.stop_event = asyncio.Event()
+        self.state = RunnerState(
+            running=True,
+            runner_mode="forward",
+            sent_count=resume_count,
+            delay_seconds=delay_seconds,
+            target_chat=RESOLVED_TARGET_CHAT,
+            current_offset="",
+            current_index=resume_count,
+            last_error="",
+            source_bot=source_chat,
+            resume_target_count=resume_count,
+        )
+        self._save_resume_state(source_chat, "", resume_count)
+        self.task = asyncio.create_task(self._worker_forward(source_chat, media_ids))
 
     async def stop(self):
         if not self.is_running():
@@ -553,6 +639,105 @@ class InlineSeeder:
 
         raise RuntimeError(f"send_inline_bot_result failed after {MAX_RETRIES} retries: {last_exc}")
 
+    async def _collect_forward_media_ids_once(self, source_chat: str) -> list[int]:
+        media_ids: list[int] = []
+        async for msg in self.client.get_chat_history(source_chat):
+            if getattr(msg, "photo", None) or getattr(msg, "video", None):
+                media_ids.append(int(msg.id))
+        media_ids.reverse()
+        return media_ids
+
+    async def _retry_collect_forward_media_ids(self, source_chat: str) -> list[int]:
+        last_exc: Optional[Exception] = None
+
+        for attempt in range(1, MAX_RETRIES + 1):
+            if self.stop_event.is_set():
+                raise asyncio.CancelledError()
+            try:
+                return await self._collect_forward_media_ids_once(source_chat)
+            except FloodWait as e:
+                wait_for = int(getattr(e, "value", getattr(e, "x", 5)))
+                self.state.last_error = f"FloodWait(collect_forward): {wait_for}s"
+                logger.warning(
+                    "FloodWait on forward source scan from %s | attempt %s/%s | waiting %ss",
+                    source_chat,
+                    attempt,
+                    MAX_RETRIES,
+                    wait_for,
+                )
+                await self._sleep_with_stop(wait_for + 1)
+                last_exc = e
+            except (RPCError, OSError, TimeoutError) as e:
+                delay = self._backoff_delay(attempt)
+                self.state.last_error = f"collect_forward retry error: {e}"
+                logger.warning(
+                    "Forward source scan failed from %s | attempt %s/%s | retry in %ss | error=%s",
+                    source_chat,
+                    attempt,
+                    MAX_RETRIES,
+                    delay,
+                    e,
+                )
+                last_exc = e
+                if attempt < MAX_RETRIES:
+                    await self._sleep_with_stop(delay)
+                else:
+                    break
+            except Exception as e:
+                self.state.last_error = f"collect_forward fatal: {e}"
+                logger.exception("Unexpected forward source scan error")
+                raise
+
+        raise RuntimeError(f"Failed to collect forward media from {source_chat} after {MAX_RETRIES} retries: {last_exc}")
+
+    async def _retry_forward_message(self, source_chat: str, message_id: int):
+        last_exc: Optional[Exception] = None
+
+        for attempt in range(1, MAX_RETRIES + 1):
+            if self.stop_event.is_set():
+                raise asyncio.CancelledError()
+            try:
+                await self.client.forward_messages(
+                    chat_id=RESOLVED_TARGET_CHAT,
+                    from_chat_id=source_chat,
+                    message_ids=message_id,
+                )
+                return
+            except FloodWait as e:
+                wait_for = int(getattr(e, "value", getattr(e, "x", 5)))
+                self.state.last_error = f"FloodWait(forward_message): {wait_for}s"
+                logger.warning(
+                    "FloodWait on forward_messages from %s | attempt %s/%s | waiting %ss",
+                    source_chat,
+                    attempt,
+                    MAX_RETRIES,
+                    wait_for,
+                )
+                await self._sleep_with_stop(wait_for + 1)
+                last_exc = e
+            except (RPCError, OSError, TimeoutError) as e:
+                delay = self._backoff_delay(attempt)
+                self.state.last_error = f"forward_message retry error: {e}"
+                logger.warning(
+                    "forward_messages failed from %s | attempt %s/%s | retry in %ss | error=%s",
+                    source_chat,
+                    attempt,
+                    MAX_RETRIES,
+                    delay,
+                    e,
+                )
+                last_exc = e
+                if attempt < MAX_RETRIES:
+                    await self._sleep_with_stop(delay)
+                else:
+                    break
+            except Exception as e:
+                self.state.last_error = f"forward_message fatal: {e}"
+                logger.exception("Unexpected forward_messages error")
+                raise
+
+        raise RuntimeError(f"forward_messages failed after {MAX_RETRIES} retries: {last_exc}")
+
     async def _notify_target_chat_error(self, text: str) -> None:
         try:
             await self.client.send_message(
@@ -562,7 +747,7 @@ class InlineSeeder:
         except Exception:
             logger.exception("Failed to send error notification to target chat")
 
-    async def _worker(self, source_bot: str):
+    async def _worker_inline(self, source_bot: str):
         offset = self.state.current_offset or ""
         start_index = self.state.current_index or 0
         manual_stop = False
@@ -644,8 +829,9 @@ class InlineSeeder:
             logger.exception("Seeder worker failed")
 
             error_text = (
-                "⚠️ Inline Seeder Stopped\n\n"
-                f"Source bot: {source_bot}\n"
+                "⚠️ Seeder Stopped\n\n"
+                f"Mode: inline\n"
+                f"Source: {source_bot}\n"
                 f"Target chat: {RESOLVED_TARGET_CHAT}\n"
                 f"Sent count: {self.state.sent_count}\n"
                 f"Current offset: {self.state.current_offset or '-'}\n"
@@ -662,7 +848,72 @@ class InlineSeeder:
             else:
                 logger.info("Seeder worker stopped")
 
+    async def _worker_forward(self, source_chat: str, media_ids: list[int]):
+        start_index = max(0, min(self.state.current_index or 0, len(media_ids)))
+        manual_stop = False
 
+        try:
+            for idx in range(start_index, len(media_ids)):
+                if self.stop_event.is_set():
+                    manual_stop = True
+                    break
+
+                message_id = media_ids[idx]
+                await self._retry_forward_message(source_chat, message_id)
+
+                self.state.sent_count += 1
+                self.state.current_index = idx + 1
+                self.state.current_offset = str(message_id)
+                self._save_resume_state(source_chat, self.state.current_offset, idx + 1)
+
+                logger.info(
+                    "Forwarded #%s message_id=%s from %s to %r | next_index=%s",
+                    self.state.sent_count,
+                    message_id,
+                    source_chat,
+                    RESOLVED_TARGET_CHAT,
+                    idx + 1,
+                )
+
+                await self._sleep_with_stop(self.state.delay_seconds)
+
+                if self.stop_event.is_set():
+                    manual_stop = True
+                    break
+
+            if not manual_stop and self.state.current_index >= len(media_ids):
+                logger.info("Reached final forward message for %s", source_chat)
+                if CLEAR_STATE_ON_FINISH:
+                    clear_progress_state()
+
+        except asyncio.CancelledError:
+            manual_stop = True
+            self.state.last_error = "cancelled"
+            logger.info("Forward seeder cancelled")
+            raise
+
+        except Exception as e:
+            self.state.last_error = str(e)
+            logger.exception("Forward seeder failed")
+            error_text = (
+                "⚠️ Seeder Stopped\n\n"
+                f"Mode: forward\n"
+                f"Source: {source_chat}\n"
+                f"Target chat: {RESOLVED_TARGET_CHAT}\n"
+                f"Sent count: {self.state.sent_count}\n"
+                f"Current message id: {self.state.current_offset or '-'}\n"
+                f"Current index: {self.state.current_index}\n"
+                f"Resume target count: {self.state.resume_target_count}\n"
+                f"Last error: {self.state.last_error or 'unknown'}"
+            )
+            await self._notify_target_chat_error(error_text)
+
+        finally:
+            self.state.running = False
+            if manual_stop:
+                logger.info("Forward seeder stopped manually")
+            else:
+                logger.info("Forward seeder stopped")
 Path(SESSIONS_DIR).mkdir(parents=True, exist_ok=True)
 
 app = Client(
@@ -728,6 +979,8 @@ async def execute_control_command(message: Message) -> None:
             f"Catcher: {CATCHER_INLINE_BOT}\n"
             f"Seizer: {SEIZER_INLINE_BOT}\n"
             f"Capture: {CAPTURE_INLINE_BOT}\n"
+            f"FW Seizer Source: {FW_SEIZER_SOURCE_CHAT}\n"
+            f"FW Capture Source: {FW_CAPTURE_SOURCE_CHAT}\n"
             f"Default delay: {DEFAULT_SEND_DELAY}s\n"
             f"Max retries: {MAX_RETRIES}\n"
             f"Retry base delay: {RETRY_BASE_DELAY}s\n"
@@ -740,9 +993,17 @@ async def execute_control_command(message: Message) -> None:
             "/startseizerbot 10\n"
             "/startcapturebot\n"
             "/startcapturebot 8\n"
+            "/startfwseizerbot\n"
+            "/startfwseizerbot 8\n"
+            "/startfwcapturebot\n"
+            "/startfwcapturebot 8\n"
             "/resumecatcherbot 2422\n"
             "/resumeseizerbot 2422\n"
             "/resumecapturebot 2422\n"
+            "/resumefwseizerbot 2422\n"
+            "/resumefwseizerbot 2422 8\n"
+            "/resumefwcapturebot 2422\n"
+            "/resumefwcapturebot 2422 8\n"
             "/stopinlinebot\n"
             "/resetinlineprogress\n"
             "/status",
@@ -756,7 +1017,8 @@ async def execute_control_command(message: Message) -> None:
         await send_control_reply(
             f"Running: {'YES' if SEEDER.is_running() else 'NO'}\n"
             f"User session: {me.first_name or ''} ({me.id})\n"
-            f"Source bot: {state.source_bot or '-'}\n"
+            f"Mode: {state.runner_mode or '-'}\n"
+            f"Source: {state.source_bot or '-'}\n"
             f"Target chat: {state.target_chat}\n"
             f"Delay: {state.delay_seconds}s\n"
             f"Sent count: {state.sent_count}\n"
@@ -795,9 +1057,10 @@ async def execute_control_command(message: Message) -> None:
 
     if cmd == "/startcatcherbot":
         delay_seconds = parse_delay_from_text(text, DEFAULT_SEND_DELAY)
-        await SEEDER.start(CATCHER_INLINE_BOT, delay_seconds)
+        await SEEDER.start_inline(CATCHER_INLINE_BOT, delay_seconds)
         await send_control_reply(
             "Started.\n"
+            f"Mode: inline\n"
             f"Source bot: {CATCHER_INLINE_BOT}\n"
             f"Target chat: {target_chat_display()}\n"
             f"Delay: {delay_seconds}s\n"
@@ -809,9 +1072,10 @@ async def execute_control_command(message: Message) -> None:
 
     if cmd == "/startseizerbot":
         delay_seconds = parse_delay_from_text(text, DEFAULT_SEND_DELAY)
-        await SEEDER.start(SEIZER_INLINE_BOT, delay_seconds)
+        await SEEDER.start_inline(SEIZER_INLINE_BOT, delay_seconds)
         await send_control_reply(
             "Started.\n"
+            f"Mode: inline\n"
             f"Source bot: {SEIZER_INLINE_BOT}\n"
             f"Target chat: {target_chat_display()}\n"
             f"Delay: {delay_seconds}s\n"
@@ -823,9 +1087,10 @@ async def execute_control_command(message: Message) -> None:
 
     if cmd == "/startcapturebot":
         delay_seconds = parse_delay_from_text(text, DEFAULT_SEND_DELAY)
-        await SEEDER.start(CAPTURE_INLINE_BOT, delay_seconds)
+        await SEEDER.start_inline(CAPTURE_INLINE_BOT, delay_seconds)
         await send_control_reply(
             "Started.\n"
+            f"Mode: inline\n"
             f"Source bot: {CAPTURE_INLINE_BOT}\n"
             f"Target chat: {target_chat_display()}\n"
             f"Delay: {delay_seconds}s\n"
@@ -835,11 +1100,40 @@ async def execute_control_command(message: Message) -> None:
         )
         return
 
+    if cmd == "/startfwseizerbot":
+        delay_seconds = parse_delay_from_text(text, DEFAULT_SEND_DELAY)
+        await SEEDER.start_forward(FW_SEIZER_SOURCE_CHAT, delay_seconds)
+        await send_control_reply(
+            "Started.\n"
+            f"Mode: forward\n"
+            f"Source channel: {FW_SEIZER_SOURCE_CHAT}\n"
+            f"Target chat: {target_chat_display()}\n"
+            f"Delay: {delay_seconds}s\n"
+            f"Resume from index: {SEEDER.state.current_index}",
+            reply_to_message_id=message.id,
+        )
+        return
+
+    if cmd == "/startfwcapturebot":
+        delay_seconds = parse_delay_from_text(text, DEFAULT_SEND_DELAY)
+        await SEEDER.start_forward(FW_CAPTURE_SOURCE_CHAT, delay_seconds)
+        await send_control_reply(
+            "Started.\n"
+            f"Mode: forward\n"
+            f"Source channel: {FW_CAPTURE_SOURCE_CHAT}\n"
+            f"Target chat: {target_chat_display()}\n"
+            f"Delay: {delay_seconds}s\n"
+            f"Resume from index: {SEEDER.state.current_index}",
+            reply_to_message_id=message.id,
+        )
+        return
+
     if cmd == "/resumecatcherbot":
         resume_count, delay_seconds = parse_resume_count_and_delay(text, DEFAULT_SEND_DELAY)
-        await SEEDER.force_resume(CATCHER_INLINE_BOT, resume_count, delay_seconds)
+        await SEEDER.force_resume_inline(CATCHER_INLINE_BOT, resume_count, delay_seconds)
         await send_control_reply(
             "Force resume started.\n"
+            f"Mode: inline\n"
             f"Source bot: {CATCHER_INLINE_BOT}\n"
             f"Target chat: {target_chat_display()}\n"
             f"Resume from count: {resume_count}\n"
@@ -852,9 +1146,10 @@ async def execute_control_command(message: Message) -> None:
 
     if cmd == "/resumeseizerbot":
         resume_count, delay_seconds = parse_resume_count_and_delay(text, DEFAULT_SEND_DELAY)
-        await SEEDER.force_resume(SEIZER_INLINE_BOT, resume_count, delay_seconds)
+        await SEEDER.force_resume_inline(SEIZER_INLINE_BOT, resume_count, delay_seconds)
         await send_control_reply(
             "Force resume started.\n"
+            f"Mode: inline\n"
             f"Source bot: {SEIZER_INLINE_BOT}\n"
             f"Target chat: {target_chat_display()}\n"
             f"Resume from count: {resume_count}\n"
@@ -867,14 +1162,45 @@ async def execute_control_command(message: Message) -> None:
 
     if cmd == "/resumecapturebot":
         resume_count, delay_seconds = parse_resume_count_and_delay(text, DEFAULT_SEND_DELAY)
-        await SEEDER.force_resume(CAPTURE_INLINE_BOT, resume_count, delay_seconds)
+        await SEEDER.force_resume_inline(CAPTURE_INLINE_BOT, resume_count, delay_seconds)
         await send_control_reply(
             "Force resume started.\n"
+            f"Mode: inline\n"
             f"Source bot: {CAPTURE_INLINE_BOT}\n"
             f"Target chat: {target_chat_display()}\n"
             f"Resume from count: {resume_count}\n"
             f"Delay: {delay_seconds}s\n"
             f"Resolved offset: {SEEDER.state.current_offset or '-'}\n"
+            f"Resolved index: {SEEDER.state.current_index}",
+            reply_to_message_id=message.id,
+        )
+        return
+
+    if cmd == "/resumefwseizerbot":
+        resume_count, delay_seconds = parse_resume_count_and_delay(text, DEFAULT_SEND_DELAY)
+        await SEEDER.force_resume_forward(FW_SEIZER_SOURCE_CHAT, resume_count, delay_seconds)
+        await send_control_reply(
+            "Force resume started.\n"
+            f"Mode: forward\n"
+            f"Source channel: {FW_SEIZER_SOURCE_CHAT}\n"
+            f"Target chat: {target_chat_display()}\n"
+            f"Resume from count: {resume_count}\n"
+            f"Delay: {delay_seconds}s\n"
+            f"Resolved index: {SEEDER.state.current_index}",
+            reply_to_message_id=message.id,
+        )
+        return
+
+    if cmd == "/resumefwcapturebot":
+        resume_count, delay_seconds = parse_resume_count_and_delay(text, DEFAULT_SEND_DELAY)
+        await SEEDER.force_resume_forward(FW_CAPTURE_SOURCE_CHAT, resume_count, delay_seconds)
+        await send_control_reply(
+            "Force resume started.\n"
+            f"Mode: forward\n"
+            f"Source channel: {FW_CAPTURE_SOURCE_CHAT}\n"
+            f"Target chat: {target_chat_display()}\n"
+            f"Resume from count: {resume_count}\n"
+            f"Delay: {delay_seconds}s\n"
             f"Resolved index: {SEEDER.state.current_index}",
             reply_to_message_id=message.id,
         )
@@ -888,9 +1214,13 @@ async def control_loop(stop_event: asyncio.Event) -> None:
         "/startcatcherbot",
         "/startseizerbot",
         "/startcapturebot",
+        "/startfwseizerbot",
+        "/startfwcapturebot",
         "/resumecatcherbot",
         "/resumeseizerbot",
         "/resumecapturebot",
+        "/resumefwseizerbot",
+        "/resumefwcapturebot",
         "/stopinlinebot",
         "/resetinlineprogress",
     }
