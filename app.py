@@ -31,6 +31,8 @@ MAX_SEND_DELAY = int(os.getenv("MAX_SEND_DELAY", "30"))
 CATCHER_INLINE_BOT = os.getenv("CATCHER_INLINE_BOT", "@Character_Catcher_Bot").strip()
 SEIZER_INLINE_BOT = os.getenv("SEIZER_INLINE_BOT", "@Character_Seizer_Bot").strip()
 CAPTURE_INLINE_BOT = os.getenv("CAPTURE_INLINE_BOT", "@CaptureCharacterBot").strip()
+TAKERS_INLINE_BOT = os.getenv("TAKERS_INLINE_BOT", "@Takers_character_bot").strip()
+GRAB_INLINE_BOT = os.getenv("GRAB_INLINE_BOT", "@Grab_Your_Waifu_Bot").strip()
 FW_SEIZER_SOURCE_CHAT = os.getenv("FW_SEIZER_SOURCE_CHAT", "@Seizer_Database").strip()
 FW_CAPTURE_SOURCE_CHAT = os.getenv("FW_CAPTURE_SOURCE_CHAT", "@CaptureDatabase").strip()
 
@@ -979,6 +981,8 @@ async def execute_control_command(message: Message) -> None:
             f"Catcher: {CATCHER_INLINE_BOT}\n"
             f"Seizer: {SEIZER_INLINE_BOT}\n"
             f"Capture: {CAPTURE_INLINE_BOT}\n"
+            f"Takers: {TAKERS_INLINE_BOT}\n"
+            f"Grab: {GRAB_INLINE_BOT}\n"
             f"FW Seizer Source: {FW_SEIZER_SOURCE_CHAT}\n"
             f"FW Capture Source: {FW_CAPTURE_SOURCE_CHAT}\n"
             f"Default delay: {DEFAULT_SEND_DELAY}s\n"
@@ -993,6 +997,10 @@ async def execute_control_command(message: Message) -> None:
             "/startseizerbot 10\n"
             "/startcapturebot\n"
             "/startcapturebot 8\n"
+            "/starttakersbot\n"
+            "/starttakersbot 8\n"
+            "/startgrabbot\n"
+            "/startgrabbot 8\n"
             "/startfwseizerbot\n"
             "/startfwseizerbot 8\n"
             "/startfwcapturebot\n"
@@ -1000,6 +1008,8 @@ async def execute_control_command(message: Message) -> None:
             "/resumecatcherbot 2422\n"
             "/resumeseizerbot 2422\n"
             "/resumecapturebot 2422\n"
+            "/resumetakersbot 2422\n"
+            "/resumegrabbot 2422\n"
             "/resumefwseizerbot 2422\n"
             "/resumefwseizerbot 2422 8\n"
             "/resumefwcapturebot 2422\n"
@@ -1100,6 +1110,36 @@ async def execute_control_command(message: Message) -> None:
         )
         return
 
+    if cmd == "/starttakersbot":
+        delay_seconds = parse_delay_from_text(text, DEFAULT_SEND_DELAY)
+        await SEEDER.start_inline(TAKERS_INLINE_BOT, delay_seconds)
+        await send_control_reply(
+            "Started.\n"
+            f"Mode: inline\n"
+            f"Source bot: {TAKERS_INLINE_BOT}\n"
+            f"Target chat: {target_chat_display()}\n"
+            f"Delay: {delay_seconds}s\n"
+            f"Resume from offset: {SEEDER.state.current_offset or '-'}\n"
+            f"Resume from index: {SEEDER.state.current_index}",
+            reply_to_message_id=message.id,
+        )
+        return
+
+    if cmd == "/startgrabbot":
+        delay_seconds = parse_delay_from_text(text, DEFAULT_SEND_DELAY)
+        await SEEDER.start_inline(GRAB_INLINE_BOT, delay_seconds)
+        await send_control_reply(
+            "Started.\n"
+            f"Mode: inline\n"
+            f"Source bot: {GRAB_INLINE_BOT}\n"
+            f"Target chat: {target_chat_display()}\n"
+            f"Delay: {delay_seconds}s\n"
+            f"Resume from offset: {SEEDER.state.current_offset or '-'}\n"
+            f"Resume from index: {SEEDER.state.current_index}",
+            reply_to_message_id=message.id,
+        )
+        return
+
     if cmd == "/startfwseizerbot":
         delay_seconds = parse_delay_from_text(text, DEFAULT_SEND_DELAY)
         await SEEDER.start_forward(FW_SEIZER_SOURCE_CHAT, delay_seconds)
@@ -1176,6 +1216,38 @@ async def execute_control_command(message: Message) -> None:
         )
         return
 
+    if cmd == "/resumetakersbot":
+        resume_count, delay_seconds = parse_resume_count_and_delay(text, DEFAULT_SEND_DELAY)
+        await SEEDER.force_resume_inline(TAKERS_INLINE_BOT, resume_count, delay_seconds)
+        await send_control_reply(
+            "Force resume started.\n"
+            f"Mode: inline\n"
+            f"Source bot: {TAKERS_INLINE_BOT}\n"
+            f"Target chat: {target_chat_display()}\n"
+            f"Resume from count: {resume_count}\n"
+            f"Delay: {delay_seconds}s\n"
+            f"Resolved offset: {SEEDER.state.current_offset or '-'}\n"
+            f"Resolved index: {SEEDER.state.current_index}",
+            reply_to_message_id=message.id,
+        )
+        return
+
+    if cmd == "/resumegrabbot":
+        resume_count, delay_seconds = parse_resume_count_and_delay(text, DEFAULT_SEND_DELAY)
+        await SEEDER.force_resume_inline(GRAB_INLINE_BOT, resume_count, delay_seconds)
+        await send_control_reply(
+            "Force resume started.\n"
+            f"Mode: inline\n"
+            f"Source bot: {GRAB_INLINE_BOT}\n"
+            f"Target chat: {target_chat_display()}\n"
+            f"Resume from count: {resume_count}\n"
+            f"Delay: {delay_seconds}s\n"
+            f"Resolved offset: {SEEDER.state.current_offset or '-'}\n"
+            f"Resolved index: {SEEDER.state.current_index}",
+            reply_to_message_id=message.id,
+        )
+        return
+
     if cmd == "/resumefwseizerbot":
         resume_count, delay_seconds = parse_resume_count_and_delay(text, DEFAULT_SEND_DELAY)
         await SEEDER.force_resume_forward(FW_SEIZER_SOURCE_CHAT, resume_count, delay_seconds)
@@ -1214,11 +1286,15 @@ async def control_loop(stop_event: asyncio.Event) -> None:
         "/startcatcherbot",
         "/startseizerbot",
         "/startcapturebot",
+        "/starttakersbot",
+        "/startgrabbot",
         "/startfwseizerbot",
         "/startfwcapturebot",
         "/resumecatcherbot",
         "/resumeseizerbot",
         "/resumecapturebot",
+        "/resumetakersbot",
+        "/resumegrabbot",
         "/resumefwseizerbot",
         "/resumefwcapturebot",
         "/stopinlinebot",
